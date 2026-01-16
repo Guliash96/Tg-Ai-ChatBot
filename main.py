@@ -21,7 +21,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = 548789253
 TARGET_CHAT_ID = -1001981383150
 
-# Глибина ланцюжка (всього 10 повідомлень: ~5 твоїх, ~5 бота)
+# Глибина контексту (ланцюжок)
 THREAD_DEPTH_LIMIT = 10 
 
 if not API_TOKEN or not NEON_URL:
@@ -36,6 +36,7 @@ db_pool = None
 
 gpt_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
+# Налаштування за замовчуванням
 DEFAULT_SYSTEM_PROMPT = None 
 DEFAULT_TEMPERATURE = 1.0  
 DEFAULT_MODEL = "gpt-5-mini" 
@@ -107,32 +108,22 @@ async def save_to_db(message: types.Message):
                 ON CONFLICT (chat_id, msg_id) DO NOTHING
             """, chat.id, message.message_id, photo.file_id, message.caption)
 
-# --- 🔥 НОВА ЛОГІКА: РЕКУРСИВНИЙ ЛАНЦЮЖОК ---
+# --- ЛОГІКА ІСТОРІЇ (THREAD) ---
 async def get_thread_context(chat_id, start_msg_id):
-    """
-    Витягує ланцюжок повідомлень (Thread) використовуючи reply_to.
-    Йде від поточного повідомлення вгору до батьків.
-    """
     async with db_pool.acquire() as con:
-        # Рекурсивний CTE запит
         sql = """
             WITH RECURSIVE thread AS (
-                -- 1. Початкова точка (поточне повідомлення)
                 SELECT m.msg_id, m.reply_to, m.user_id, m.date_msg, t.msg_txt, 1 as depth
                 FROM msg_meta m
                 JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
                 WHERE m.chat_id = $1 AND m.msg_id = $2
-
                 UNION ALL
-
-                -- 2. Рекурсивний крок (шукаємо батька)
                 SELECT parent.msg_id, parent.reply_to, parent.user_id, parent.date_msg, pt.msg_txt, thread.depth + 1
                 FROM msg_meta parent
                 JOIN msg_txt pt ON parent.chat_id = pt.chat_id AND parent.msg_id = pt.msg_id
                 JOIN thread ON thread.reply_to = parent.msg_id
                 WHERE parent.chat_id = $1 AND thread.depth < $3
             )
-            -- 3. Вибираємо результат і додаємо імена юзерів
             SELECT thread.*, u.first_name 
             FROM thread
             LEFT JOIN users u ON thread.user_id = u.user_id
@@ -141,19 +132,31 @@ async def get_thread_context(chat_id, start_msg_id):
         rows = await con.fetch(sql, chat_id, start_msg_id, THREAD_DEPTH_LIMIT)
         return rows
 
-# --- 🔥 ХЕЛПЕР ДЛЯ РОЗБИТТЯ ПОВІДОМЛЕНЬ ---
+# --- 🔥 ОНОВЛЕНИЙ ХЕЛПЕР ВІДПРАВКИ (БРОНЕБІЙНИЙ) ---
 async def send_chunked_response(message_obj, text):
-    """Розбиває текст на шматки по 4000 символів і відправляє"""
+    """
+    Розбиває текст і відправляє. Якщо Markdown ламається — шле текстом.
+    """
+    async def send_safe(chunk):
+        try:
+            return await message_obj.answer(chunk, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            try:
+                # Fallback: пробуємо без форматування
+                return await message_obj.answer(chunk, parse_mode=None)
+            except Exception as e:
+                logging.error(f"Failed to send chunk: {e}")
+                return None
+
     if len(text) <= 4000:
-        sent = await message_obj.reply(text, parse_mode=ParseMode.MARKDOWN)
-        await save_to_db(sent)
+        sent = await send_safe(text)
+        if sent: await save_to_db(sent)
     else:
         chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
         for chunk in chunks:
-            sent = await message_obj.answer(chunk, parse_mode=ParseMode.MARKDOWN)
-            await save_to_db(sent)
+            sent = await send_safe(chunk)
+            if sent: await save_to_db(sent)
 
-# --- ДОПОМІЖНІ ---
 def get_cutoff_date(period_code):
     now = datetime.utcnow()
     if period_code == '1d': return now - timedelta(days=1)
@@ -169,7 +172,7 @@ def get_period_name(period_code):
 
 
 # ==========================================
-# ХЕНДЛЕРИ СИСТЕМИ
+# ХЕНДЛЕРИ НАЛАШТУВАНЬ
 # ==========================================
 
 @dp.message(F.text.startswith('!system'))
@@ -204,7 +207,7 @@ async def cmd_clear_system(message: types.Message):
 @dp.message(F.text.lower().startswith('!forget'))
 async def cmd_forget(message: types.Message):
     await save_to_db(message)
-    await message.answer("🧹 <b>Контекст 'освіжено'.</b> (Це візуальна команда, справжній контекст тепер залежить від того, на яке повідомлення ти відповідаєш).", parse_mode=ParseMode.HTML)
+    await message.answer("🧹 <b>Контекст 'освіжено'.</b> (Візуально). Справжній контекст залежить від reply-ланцюжка.", parse_mode=ParseMode.HTML)
 
 @dp.message(F.text.lower().startswith('!temp'))
 async def cmd_set_temp(message: types.Message):
@@ -228,24 +231,19 @@ async def cmd_set_temp(message: types.Message):
     except ValueError:
         await message.answer("❌ Введи число (наприклад 1.0).")
 
-# 🔥 КОМАНДА: !models
+# !models
 @dp.message(F.text.lower().startswith('!models') | F.text.lower().startswith('!model'))
 async def cmd_models_menu(message: types.Message):
     await save_to_db(message)
     chat_id = message.chat.id
-    
     async with db_pool.acquire() as con:
         current_model = await con.fetchval("SELECT model_name FROM chats WHERE chat_id=$1", chat_id)
-    
     current_model = current_model if current_model else DEFAULT_MODEL
-    
     text = f"💾 <b>Поточна модель:</b> <code>{current_model}</code>\n\n👇 <b>Обери нову:</b>"
-    
     builder = InlineKeyboardBuilder()
     for model in AVAILABLE_MODELS:
         label = f"✅ {model}" if model == current_model else model
         builder.button(text=label, callback_data=f"set_mdl_{model}")
-        
     builder.adjust(1)
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=builder.as_markup())
 
@@ -253,17 +251,13 @@ async def cmd_models_menu(message: types.Message):
 async def cb_set_model(callback: CallbackQuery):
     selected_model = callback.data.replace("set_mdl_", "")
     chat_id = callback.message.chat.id
-    
     if selected_model not in AVAILABLE_MODELS:
-        await callback.answer("❌ Невідома модель.", show_alert=True)
-        return
-        
+        await callback.answer("❌ Невідома модель.", show_alert=True); return
     try:
         async with db_pool.acquire() as con:
             await con.execute("UPDATE chats SET model_name=$1 WHERE chat_id=$2", selected_model, chat_id)
         await callback.message.edit_text(f"💾 <b>Встановлено модель:</b> <code>{selected_model}</code>", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await callback.message.edit_text(f"Помилка БД: {e}")
+    except Exception as e: await callback.message.edit_text(f"Помилка БД: {e}")
 
 
 # ==========================================
@@ -273,14 +267,10 @@ async def cb_set_model(callback: CallbackQuery):
 async def cmd_analyze_menu(message: types.Message):
     await save_to_db(message)
     chat_id = message.chat.id
-    sql = """
-        SELECT u.user_id, u.first_name, COUNT(m.msg_id) as cnt
-        FROM msg_meta m JOIN users u ON m.user_id = u.user_id JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
-        WHERE m.chat_id = $1 GROUP BY u.user_id, u.first_name ORDER BY cnt DESC LIMIT 20
-    """
+    sql = "SELECT u.user_id, u.first_name, COUNT(m.msg_id) as cnt FROM msg_meta m JOIN users u ON m.user_id = u.user_id JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id WHERE m.chat_id = $1 GROUP BY u.user_id, u.first_name ORDER BY cnt DESC LIMIT 20"
     try:
         async with db_pool.acquire() as con: rows = await con.fetch(sql, chat_id)
-    except Exception as e: await message.answer(f"Помилка БД: {e}"); return
+    except: await message.answer("Помилка БД."); return
     if not rows: await message.answer("Немає текстових даних."); return
     builder = InlineKeyboardBuilder()
     for row in rows: builder.button(text=row['first_name'], callback_data=f"anlz_sel_{row['user_id']}")
@@ -312,53 +302,40 @@ async def cb_analyze_run(callback: CallbackQuery):
                 last_run = await con.fetchval("SELECT last_1000_analyze FROM users WHERE user_id=$1", caller_id)
                 if last_run:
                     next_run = last_run + timedelta(hours=24)
-                    now = datetime.utcnow()
-                    if now < next_run:
-                        diff = next_run - now
-                        h, r = divmod(diff.seconds, 3600)
-                        m, _ = divmod(r, 60)
-                        await callback.answer(f"⛔ Ліміт! Чекай: {h}год {m}хв", show_alert=True)
-                        return
+                    if datetime.utcnow() < next_run:
+                        diff = next_run - datetime.utcnow()
+                        h, r = divmod(diff.seconds, 3600); m, _ = divmod(r, 60)
+                        await callback.answer(f"⛔ Ліміт! Чекай: {h}год {m}хв", show_alert=True); return
                 await con.execute("UPDATE users SET last_1000_analyze=$1 WHERE user_id=$2", datetime.utcnow(), caller_id)
-        except Exception as e: logging.error(f"Limit Error: {e}")
+        except: pass
 
     await callback.message.edit_text("⏳ <b>Збираю архів...</b>", parse_mode=ParseMode.HTML)
     
-    sql = """
-        SELECT t.msg_txt FROM msg_meta m JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
-        WHERE m.chat_id = $1 AND m.user_id = $2 AND t.msg_txt IS NOT NULL AND t.msg_txt != ''
-        ORDER BY m.date_msg DESC LIMIT $3
-    """
+    sql = "SELECT t.msg_txt FROM msg_meta m JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id WHERE m.chat_id = $1 AND m.user_id = $2 AND t.msg_txt IS NOT NULL AND t.msg_txt != '' ORDER BY m.date_msg DESC LIMIT $3"
     try:
         async with db_pool.acquire() as con:
             rows = await con.fetch(sql, chat_id, target_uid, limit)
             user_name = await con.fetchval("SELECT first_name FROM users WHERE user_id=$1", target_uid)
             chat_model = await con.fetchval("SELECT model_name FROM chats WHERE chat_id=$1", chat_id)
-        
         current_model = chat_model if chat_model else DEFAULT_MODEL
         texts = [r['msg_txt'] for r in rows if r['msg_txt'] and str(r['msg_txt']).strip()]
-        if not texts: await callback.message.edit_text("❌ Тільки картинки/стікери."); return
+        if not texts: await callback.message.edit_text("❌ Тільки картинки."); return
         text_dump = "\n".join(texts)
-    except Exception as e: await callback.message.edit_text("Помилка БД."); return
+    except: await callback.message.edit_text("Помилка БД."); return
 
     sys_instr = "Ти — досвідчений психоаналітик."
-    prompt = f"Проаналізуй повідомлення від {user_name}. Склади детальний портрет. Текст:\n{text_dump}"
+    prompt = f"Проаналізуй: {user_name}. Текст:\n{text_dump}"
     
     try:
-        response = await gpt_client.chat.completions.create(
-            model=current_model, messages=[{"role":"system","content":sys_instr},{"role":"user","content":prompt}]
-        )
-        # Використовуємо універсальну функцію для відправки
-        await callback.message.delete() # Видаляємо "Збираю архів"
+        response = await gpt_client.chat.completions.create(model=current_model, messages=[{"role":"system","content":sys_instr},{"role":"user","content":prompt}])
+        await callback.message.delete()
         await send_chunked_response(callback.message, f"🧠 <b>Аналіз {user_name}:</b>\n\n{response.choices[0].message.content}")
-
     except Exception as e:
-        logging.error(f"Analysis AI Error: {e}")
         await callback.message.answer(f"⚠️ Помилка AI: {e}")
 
 
 # ==========================================
-# ХЕНДЛЕРИ СТАТИСТИКИ ТА ІНШЕ (Без змін)
+# СТАТИСТИКА І Т.Д.
 # ==========================================
 @dp.message(F.text.lower().startswith('!stats'))
 async def cmd_stats_menu(message: types.Message):
@@ -410,8 +387,7 @@ async def cb_show_group_stats(callback: CallbackQuery):
         else:
             total_msgs = await con.fetchval("SELECT COUNT(*) FROM msg_meta WHERE chat_id=$1", chat_id)
             top_rows = await con.fetch("SELECT u.first_name, COUNT(m.msg_id) as cnt FROM msg_meta m JOIN users u ON m.user_id = u.user_id WHERE m.chat_id = $1 GROUP BY u.first_name ORDER BY cnt DESC LIMIT 5", chat_id)
-    period_name = get_period_name(period)
-    text = f"📊 <b>Статистика ({period_name})</b>\n\n💬 Всього: <b>{total_msgs}</b>\n\n"
+    text = f"📊 <b>Статистика ({get_period_name(period)})</b>\n\n💬 Всього: <b>{total_msgs}</b>\n\n"
     if total_msgs > 0:
         text += "🏆 <b>ТОП-5:</b>\n"
         for i, row in enumerate(top_rows, 1): text += f"{i}. {str(row['first_name']).replace('<','&lt;')} — {row['cnt']}\n"
@@ -428,9 +404,7 @@ async def cb_show_user_list(callback: CallbackQuery):
     async with db_pool.acquire() as con:
         if cutoff: rows = await con.fetch("SELECT u.user_id, u.first_name, COUNT(m.msg_id) as cnt FROM msg_meta m JOIN users u ON m.user_id = u.user_id WHERE m.chat_id = $1 AND m.date_msg >= $2 GROUP BY u.user_id, u.first_name ORDER BY cnt DESC LIMIT 20", chat_id, cutoff)
         else: rows = await con.fetch("SELECT u.user_id, u.first_name, COUNT(m.msg_id) as cnt FROM msg_meta m JOIN users u ON m.user_id = u.user_id WHERE m.chat_id = $1 GROUP BY u.user_id, u.first_name ORDER BY cnt DESC LIMIT 20", chat_id)
-    if not rows:
-        await callback.answer("Пусто.", show_alert=True)
-        return
+    if not rows: await callback.answer("Пусто.", show_alert=True); return
     builder = InlineKeyboardBuilder()
     for row in rows: builder.button(text=row['first_name'], callback_data=f"stat_u_{row['user_id']}_{period}")
     builder.adjust(2)
@@ -458,6 +432,7 @@ async def cb_user_details(callback: CallbackQuery):
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=builder.as_markup())
     await callback.answer()
 
+# --- СПЕЦІАЛЬНІ КОМАНДИ ---
 @dp.message(F.text.lower().startswith('!ignorehere'))
 async def cmd_ignore_here(message: types.Message):
     await save_to_db(message)
@@ -478,12 +453,22 @@ async def cmd_help(message: types.Message):
             "🔕 <b>!ignorehere</b> — Сховатися від !here\n🎲 <b>!roulette</b> — Рулетка")
     await message.answer(text, parse_mode=ParseMode.HTML)
 
+# 🔥 ОНОВЛЕНА РУЛЕТКА (З урахуванням ignorehere)
 @dp.message(F.text.lower().startswith('!roulette'))
 async def cmd_roulette(message: types.Message):
     if message.chat.type == 'private': return 
     await save_to_db(message)
     chat_id = message.chat.id
-    sql = "SELECT * FROM (SELECT DISTINCT u.user_id, u.username, u.first_name FROM users u JOIN msg_meta m ON u.user_id = m.user_id WHERE m.chat_id = $1) t ORDER BY RANDOM() LIMIT 1"
+    # LEFT JOIN фільтрує тих, хто в ignorehere
+    sql = """
+        SELECT * FROM (
+            SELECT DISTINCT u.user_id, u.username, u.first_name
+            FROM users u
+            JOIN msg_meta m ON u.user_id = m.user_id
+            LEFT JOIN here_ignore hi ON u.user_id = hi.user_id AND m.chat_id = hi.chat_id
+            WHERE m.chat_id = $1 AND hi.user_id IS NULL
+        ) t ORDER BY RANDOM() LIMIT 1
+    """
     try:
         async with db_pool.acquire() as con: row = await con.fetchrow(sql, chat_id)
         if not row: return
@@ -508,6 +493,53 @@ async def cmd_remote_say(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     try: await bot.send_message(chat_id=TARGET_CHAT_ID, text=message.text[5:].strip())
     except: pass
+
+# ==========================================
+# 🔥 НОВИЙ ХЕНДЛЕР: ЗАХИСТ ВІД ТЕГІВ "УЗБЕКІВ"
+# ==========================================
+@dp.message(F.entities)
+async def check_mentions_handler(message: types.Message):
+    # Спочатку збережемо, щоб не втратити
+    await save_to_db(message)
+    
+    mentioned_ids = []
+    mentioned_usernames = []
+
+    for entity in message.entities:
+        if entity.type == 'text_mention':
+            mentioned_ids.append(entity.user.id)
+        elif entity.type == 'mention':
+            # Витягуємо юзернейм без @
+            uname = message.text[entity.offset + 1 : entity.offset + entity.length]
+            mentioned_usernames.append(uname)
+
+    if not mentioned_ids and not mentioned_usernames:
+        return # Нема кого перевіряти
+
+    chat_id = message.chat.id
+    
+    # Перевіряємо, чи є згадані люди в списку ігнору
+    try:
+        async with db_pool.acquire() as con:
+            sql = """
+                SELECT 1 
+                FROM here_ignore hi
+                LEFT JOIN users u ON hi.user_id = u.user_id
+                WHERE hi.chat_id = $1 
+                  AND (hi.user_id = ANY($2) OR u.username = ANY($3))
+                LIMIT 1
+            """
+            exists = await con.fetchval(sql, chat_id, mentioned_ids, mentioned_usernames)
+            
+            if exists:
+                await message.reply("ЧШШШШ УЗБЕКІ СПЯТЬ")
+    except Exception as e:
+        logging.error(f"Mention Check Error: {e}")
+
+    # Важливо: ми не робимо return, щоб повідомлення пішло далі 
+    # (наприклад, якщо це команда !gpt з тегом, вона все одно має спрацювати, 
+    # або якщо це просто повідомлення, воно піде в лог)
+
 
 # ==========================================
 # УНІВЕРСАЛЬНИЙ GPT ХЕНДЛЕР (В КІНЦІ)
@@ -545,9 +577,8 @@ async def cmd_universal_gpt(message: types.Message):
     if sys_prompt:
         messages_payload.append({"role": "system", "content": sys_prompt})
 
-    # 🔥 ВИКОРИСТОВУЄМО НОВИЙ THREAD CONTEXT
+    # 🔥 ТЕПЕР ТІЛЬКИ РЕПЛАЙ-ЛАНЦЮЖОК
     try:
-        # Передаємо message_id поточного повідомлення, щоб знайти його предків
         history_rows = await get_thread_context(chat_id, message.message_id)
         
         for row in history_rows:
@@ -569,8 +600,6 @@ async def cmd_universal_gpt(message: types.Message):
             temperature=temperature
         )
         reply_text = response.choices[0].message.content
-        
-        # 🔥 ВИКОРИСТОВУЄМО ФУНКЦІЮ РОЗБИТТЯ ДЛЯ ВІДПОВІДІ
         await send_chunked_response(message, reply_text)
 
     except Exception as e:
