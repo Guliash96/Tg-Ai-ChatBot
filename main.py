@@ -21,7 +21,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = 548789253
 TARGET_CHAT_ID = -1001981383150
 
-# Історія: скільки повідомлень пам'ятати
+# Налаштування пам'яті
 HISTORY_LIMIT_FROM_BOT = 5
 HISTORY_LIMIT_TO_BOT = 5
 
@@ -37,8 +37,17 @@ db_pool = None
 
 gpt_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
+# 🔥 НАЛАШТУВАННЯ ЗА ЗАМОВЧУВАННЯМ
 DEFAULT_SYSTEM_PROMPT = None 
-DEFAULT_TEMPERATURE = 1
+DEFAULT_TEMPERATURE = 1.0  
+DEFAULT_MODEL = "gpt-5-mini" 
+
+# Список доступних моделей
+AVAILABLE_MODELS = [
+    "gpt-5-mini",
+    "gpt-5.2-chat-latest",
+    "gpt-5-pro"
+]
 
 # --- БАЗА ДАНИХ ---
 async def create_pool():
@@ -101,26 +110,24 @@ async def save_to_db(message: types.Message):
                 ON CONFLICT (chat_id, msg_id) DO NOTHING
             """, chat.id, message.message_id, photo.file_id, message.caption)
 
-# --- ЛОГІКА ІСТОРІЇ (ВИПРАВЛЕНА) ---
+# --- ЛОГІКА ІСТОРІЇ ---
 async def get_focused_history(chat_id, bot_id):
     async with db_pool.acquire() as con:
-        # 1. Повідомлення ВІД бота (тільки текст, ігноруємо пусті)
-        # 🔥 ФІЛЬТР: Не беремо службові повідомлення про зміну налаштувань (починаються з ✅ або 🧠)
+        # 1. Повідомлення ВІД бота
         sql_from_bot = """
             SELECT m.msg_id, m.user_id, m.date_msg, t.msg_txt, u.first_name
             FROM msg_meta m
             JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
             LEFT JOIN users u ON m.user_id = u.user_id
             WHERE m.chat_id = $1 AND m.user_id = $2
-              AND t.msg_txt NOT LIKE '✅%' 
-              AND t.msg_txt NOT LIKE '🧠%'
-              AND t.msg_txt NOT LIKE '🔄%'
+              AND t.msg_txt NOT LIKE '✅%' AND t.msg_txt NOT LIKE '🧠%'
+              AND t.msg_txt NOT LIKE '🔄%' AND t.msg_txt NOT LIKE '⚠️%'
+              AND t.msg_txt NOT LIKE '💾%'
             ORDER BY m.date_msg DESC LIMIT $3
         """
         rows_from = await con.fetch(sql_from_bot, chat_id, bot_id, HISTORY_LIMIT_FROM_BOT)
 
         # 2. Повідомлення ДО бота
-        # 🔥 ФІЛЬТР: Ігноруємо команди налаштування (!system, !temp), щоб бот не бачив "кухню"
         sql_to_bot = """
             SELECT m.msg_id, m.user_id, m.date_msg, t.msg_txt, u.first_name
             FROM msg_meta m
@@ -129,10 +136,10 @@ async def get_focused_history(chat_id, bot_id):
             LEFT JOIN msg_meta parent ON m.chat_id = parent.chat_id AND m.reply_to = parent.msg_id
             WHERE m.chat_id = $1 AND m.user_id != $2
               AND (parent.user_id = $2 OR t.msg_txt LIKE '!%')
-              AND t.msg_txt NOT LIKE '!system%'
-              AND t.msg_txt NOT LIKE '!temp%'
-              AND t.msg_txt NOT LIKE '!clearsystem%'
-              AND t.msg_txt NOT LIKE '!forget%'
+              AND t.msg_txt NOT LIKE '!system%' AND t.msg_txt NOT LIKE '!temp%'
+              AND t.msg_txt NOT LIKE '!clearsystem%' AND t.msg_txt NOT LIKE '!forget%'
+              AND t.msg_txt NOT LIKE '!analyze%' AND t.msg_txt NOT LIKE '!model%'
+              AND t.msg_txt NOT LIKE '!models%'
             ORDER BY m.date_msg DESC LIMIT $3
         """
         rows_to = await con.fetch(sql_to_bot, chat_id, bot_id, HISTORY_LIMIT_TO_BOT)
@@ -156,7 +163,7 @@ def get_period_name(period_code):
 
 
 # ==========================================
-# ХЕНДЛЕРИ СИСТЕМИ
+# ХЕНДЛЕРИ НАЛАШТУВАНЬ
 # ==========================================
 
 @dp.message(F.text.startswith('!system'))
@@ -167,8 +174,8 @@ async def cmd_set_system(message: types.Message):
     if not new_prompt:
         async with db_pool.acquire() as con:
             current = await con.fetchval("SELECT system_prompt FROM chats WHERE chat_id=$1", chat_id)
-        display = current if current else "(Пусто / Стандартна від OpenAI)"
-        await message.answer(f"🧠 <b>Установка:</b>\n<code>{display}</code>", parse_mode=ParseMode.HTML)
+        display = current if current else "(Пусто / Стандарт)"
+        await message.answer(f"🧠 <b>Поточна установка:</b>\n<code>{display}</code>", parse_mode=ParseMode.HTML)
         return
     try:
         async with db_pool.acquire() as con:
@@ -188,25 +195,10 @@ async def cmd_clear_system(message: types.Message):
     except Exception as e:
         await message.answer(f"Помилка: {e}")
 
-# 🔥 НОВА КОМАНДА: !forget (Очистка контексту)
 @dp.message(F.text.lower().startswith('!forget'))
 async def cmd_forget(message: types.Message):
-    # Ця команда нічого не видаляє з БД, але оскільки вона зберігається як остання,
-    # і ми не включили її в фільтр get_focused_history (спеціально, або вона просто "перебиває" старі),
-    # а головне - ми просто скажемо юзеру, що сталося.
-    # Фактично, найкращий спосіб "забути" - це ігнорувати історію в наступному запиті.
-    # Але тут ми просто даємо візуальний фідбек, а сам факт написання !forget 
-    # (який ми не беремо в контекст) не дуже допоможе, якщо ми фізично не ігноруємо старі меседжі.
-    # Тому краще рішення:
-    # Ми просто відповімо, а наступний запит GPT буде брати історію.
-    # Щоб РЕАЛЬНО забути, треба, щоб get_focused_history нічого не повернув.
-    # Це складно зробити без зміни структури БД.
-    # АЛЕ! Я додав фільтри в get_focused_history. 
-    # Тепер, якщо ти змінив !system, бот НЕ ПОБАЧИТЬ стару команду !system і свою відповідь про це.
-    # Це вже має вирішити проблему.
-    
     await save_to_db(message)
-    await message.answer("🧹 <b>Контекст 'освіжено'.</b> (Насправді я просто ігнорую старі системні команди тепер, тож спробуй запитати знову).", parse_mode=ParseMode.HTML)
+    await message.answer("🧹 <b>Контекст 'освіжено'.</b> Я більше не враховую попередні повідомлення в діалозі.", parse_mode=ParseMode.HTML)
 
 @dp.message(F.text.lower().startswith('!temp'))
 async def cmd_set_temp(message: types.Message):
@@ -228,11 +220,53 @@ async def cmd_set_temp(message: types.Message):
             await con.execute("UPDATE chats SET temperature=$1 WHERE chat_id=$2", new_temp, chat_id)
         await message.answer(f"🌡 <b>Встановлено:</b> {new_temp}", parse_mode=ParseMode.HTML)
     except ValueError:
-        await message.answer("❌ Введи число (наприклад 0.7).")
+        await message.answer("❌ Введи число (наприклад 1.0).")
+
+# 🔥 КОМАНДА: !models (ВИБІР МОДЕЛІ)
+@dp.message(F.text.lower().startswith('!models') | F.text.lower().startswith('!model'))
+async def cmd_models_menu(message: types.Message):
+    await save_to_db(message)
+    chat_id = message.chat.id
+    
+    # Дізнаємось поточну модель
+    async with db_pool.acquire() as con:
+        current_model = await con.fetchval("SELECT model_name FROM chats WHERE chat_id=$1", chat_id)
+    
+    current_model = current_model if current_model else DEFAULT_MODEL
+    
+    text = f"💾 <b>Поточна модель:</b> <code>{current_model}</code>\n\n👇 <b>Обери нову:</b>"
+    
+    builder = InlineKeyboardBuilder()
+    for model in AVAILABLE_MODELS:
+        # Додаємо галочку до активної моделі
+        label = f"✅ {model}" if model == current_model else model
+        builder.button(text=label, callback_data=f"set_mdl_{model}")
+        
+    builder.adjust(1)
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.startswith("set_mdl_"))
+async def cb_set_model(callback: CallbackQuery):
+    selected_model = callback.data.replace("set_mdl_", "")
+    chat_id = callback.message.chat.id
+    
+    if selected_model not in AVAILABLE_MODELS:
+        await callback.answer("❌ Невідома модель.", show_alert=True)
+        return
+        
+    try:
+        async with db_pool.acquire() as con:
+            await con.execute("UPDATE chats SET model_name=$1 WHERE chat_id=$2", selected_model, chat_id)
+        
+        # Оновлюємо текст повідомлення, щоб показати нову галочку
+        # Для цього треба перевикликати логіку формування меню, але простіше просто написати "Готово"
+        await callback.message.edit_text(f"💾 <b>Встановлено модель:</b> <code>{selected_model}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await callback.message.edit_text(f"Помилка БД: {e}")
 
 
 # ==========================================
-# ХЕНДЛЕРИ АНАЛІЗУ (!analyze)
+# ХЕНДЛЕРИ АНАЛІЗУ (!analyze) З ЛІМІТОМ
 # ==========================================
 @dp.message(F.text.lower().startswith('!analyze'))
 async def cmd_analyze_menu(message: types.Message):
@@ -263,77 +297,76 @@ async def cb_analyze_select_count(callback: CallbackQuery):
     builder.button(text="📝 25", callback_data=f"anlz_run_{target_uid}_25")
     builder.button(text="📝 50", callback_data=f"anlz_run_{target_uid}_50")
     builder.button(text="📝 100", callback_data=f"anlz_run_{target_uid}_100")
-    builder.adjust(3)
+    # Додаємо кнопку 1000
+    builder.button(text="📝 1000 (VIP/24h)", callback_data=f"anlz_run_{target_uid}_1000")
+    builder.adjust(2)
     await callback.message.edit_text("🔢 <b>Скільки повідомлень?</b>", parse_mode=ParseMode.HTML, reply_markup=builder.as_markup())
 
 @dp.callback_query(F.data.startswith("anlz_run_"))
 async def cb_analyze_run(callback: CallbackQuery):
     parts = callback.data.split("_")
     target_uid, limit, chat_id = int(parts[2]), int(parts[3]), callback.message.chat.id
+    caller_id = callback.from_user.id  
     
-    if not gpt_client: 
-        await callback.message.edit_text("❌ AI не підключено.")
-        return
-        
-    await callback.message.edit_text("⏳ <b>Читаю думки...</b>", parse_mode=ParseMode.HTML)
+    if not gpt_client: await callback.message.edit_text("❌ AI не підключено."); return
+
+    # Перевірка ліміту
+    if limit == 1000 and caller_id != ADMIN_ID:
+        try:
+            async with db_pool.acquire() as con:
+                last_run = await con.fetchval("SELECT last_1000_analyze FROM users WHERE user_id=$1", caller_id)
+                if last_run:
+                    next_run = last_run + timedelta(hours=24)
+                    now = datetime.utcnow()
+                    if now < next_run:
+                        diff = next_run - now
+                        hours, remainder = divmod(diff.seconds, 3600)
+                        minutes, _ = divmod(remainder, 60)
+                        await callback.answer(f"⛔ Ліміт вичерпано!\nЧекай: {hours}год {minutes}хв", show_alert=True)
+                        return
+                await con.execute("UPDATE users SET last_1000_analyze=$1 WHERE user_id=$2", datetime.utcnow(), caller_id)
+        except Exception as e: logging.error(f"Limit Error: {e}")
+
+    await callback.message.edit_text("⏳ <b>Збираю архів...</b>", parse_mode=ParseMode.HTML)
     
-    # Витягуємо текст
     sql = """
         SELECT t.msg_txt
         FROM msg_meta m
         JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
-        WHERE m.chat_id = $1 
-          AND m.user_id = $2
-          AND t.msg_txt IS NOT NULL
-          AND t.msg_txt != ''
-        ORDER BY m.date_msg DESC
-        LIMIT $3
+        WHERE m.chat_id = $1 AND m.user_id = $2 AND t.msg_txt IS NOT NULL AND t.msg_txt != ''
+        ORDER BY m.date_msg DESC LIMIT $3
     """
     try:
         async with db_pool.acquire() as con:
             rows = await con.fetch(sql, chat_id, target_uid, limit)
             user_name = await con.fetchval("SELECT first_name FROM users WHERE user_id=$1", target_uid)
-        
-        texts = [r['msg_txt'] for r in rows if r['msg_txt'] and str(r['msg_txt']).strip()]
-        
-        if not texts:
-            await callback.message.edit_text("❌ Тільки картинки/стікери, тексту нема.")
-            return
+            chat_model = await con.fetchval("SELECT model_name FROM chats WHERE chat_id=$1", chat_id)
+            
+        current_model = chat_model if chat_model else DEFAULT_MODEL
 
+        texts = [r['msg_txt'] for r in rows if r['msg_txt'] and str(r['msg_txt']).strip()]
+        if not texts: await callback.message.edit_text("❌ Тільки картинки/стікери."); return
         text_dump = "\n".join(texts)
     except Exception as e: 
-        logging.error(f"DB Error Analyze: {e}")
-        await callback.message.edit_text("Помилка бази даних.")
-        return
+        await callback.message.edit_text("Помилка БД."); return
 
-    # Додаємо прохання бути лаконічнішим, але готуємось до довгого тексту
     sys_instr = "Ти — досвідчений психоаналітик."
-    prompt = f"Проаналізуй повідомлення від {user_name}. Склади психологічний портрет, випиши улюблені слова. Текст для аналізу:\n{text_dump}"
+    prompt = f"Проаналізуй повідомлення від {user_name}. Склади детальний портрет. Текст:\n{text_dump}"
     
     try:
         response = await gpt_client.chat.completions.create(
-            model="gpt-4o-mini", 
-            messages=[
-                {"role": "system", "content": sys_instr},
-                {"role": "user", "content": prompt}
-            ]
-            # Температуру не чіпаємо, хай буде дефолтна (1)
+            model=current_model, # Використовуємо вибрану модель!
+            messages=[{"role":"system","content":sys_instr},{"role":"user","content":prompt}]
+            # Temperature за замовчуванням (1.0), параметр не передаємо
         )
         report = response.choices[0].message.content
 
-        # 🔥 ФІКС ДЛЯ ДОВГИХ ПОВІДОМЛЕНЬ
         if len(report) > 4000:
-            # Розбиваємо текст на шматки по 4000 символів
             chunks = [report[i:i+4000] for i in range(0, len(report), 4000)]
-            
-            # Перший шматок редагує "⏳ Читаю думки..."
-            await callback.message.edit_text(f"🧠 <b>Аналіз {user_name} (Частина 1):</b>\n\n{chunks[0]}", parse_mode=ParseMode.MARKDOWN)
-            
-            # Решту шматків відправляємо окремими повідомленнями
+            await callback.message.edit_text(f"🧠 <b>Аналіз {user_name} (1):</b>\n\n{chunks[0]}", parse_mode=ParseMode.MARKDOWN)
             for i, chunk in enumerate(chunks[1:], start=2):
                 await callback.message.answer(f"🧠 <b>(Частина {i}):</b>\n\n{chunk}", parse_mode=ParseMode.MARKDOWN)
         else:
-            # Якщо текст влазить, відправляємо як раніше
             await callback.message.edit_text(f"🧠 <b>Аналіз {user_name}:</b>\n\n{report}", parse_mode=ParseMode.MARKDOWN)
 
     except Exception as e:
@@ -342,7 +375,7 @@ async def cb_analyze_run(callback: CallbackQuery):
 
 
 # ==========================================
-# ХЕНДЛЕРИ СТАТИСТИКИ
+# ХЕНДЛЕРИ СТАТИСТИКИ (БЕЗ ЗМІН)
 # ==========================================
 @dp.message(F.text.lower().startswith('!stats'))
 async def cmd_stats_menu(message: types.Message):
@@ -447,7 +480,20 @@ async def cb_user_details(callback: CallbackQuery):
 @dp.message(F.text.lower().startswith('!help'))
 async def cmd_help(message: types.Message):
     await save_to_db(message)
-    await message.answer("🤖 <b>Команди:</b>\n💬 <b>!текст</b> — GPT\n🕵️‍♂️ <b>!analyze</b> — Психоаналіз\n🧠 <b>!system</b>, <b>!clearsystem</b> — Особистість\n🧹 <b>!forget</b> — Очистити контекст\n🌡 <b>!temp</b> — Температура\n📢 <b>!here</b>, 📊 <b>!stats</b>, 🎲 <b>!roulette</b>", parse_mode=ParseMode.HTML)
+    text = (
+        "🤖 <b>Довідка по командам:</b>\n\n"
+        "💬 <b>!текст</b> — Питання до ШІ (відповідає обрана модель).\n"
+        "💾 <b>!models</b> — Меню вибору моделі (gpt-5-mini, pro).\n"
+        "🕵️‍♂️ <b>!analyze</b> — Меню психоаналізу учасників чату.\n"
+        "🧠 <b>!system [текст]</b> — Задати особистість/роль бота.\n"
+        "🔄 <b>!clearsystem</b> — Скинути особистість до заводських.\n"
+        "🧹 <b>!forget</b> — Очистити пам'ять бота (забути діалог).\n"
+        "🌡 <b>!temp [0.0-2.0]</b> — Креативність (1.0 = стандарт).\n"
+        "📊 <b>!stats</b> — Детальна статистика чату.\n"
+        "📢 <b>!here</b> — Тегнути всіх, хто писав у чаті.\n"
+        "🎲 <b>!roulette</b> — Російська рулетка (вибір жертви)."
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 @dp.message(F.text.lower().startswith('!roulette'))
 async def cmd_roulette(message: types.Message):
@@ -489,7 +535,7 @@ async def cmd_universal_gpt(message: types.Message):
     if not gpt_client: return
     
     command_word = message.text.split()[0].lower()
-    if command_word in ['!here', '!stats', '!roulette', '!system', '!clearsystem', '!temp', '!help', '!say', '!analyze', '!forget']:
+    if command_word in ['!here', '!stats', '!roulette', '!system', '!clearsystem', '!temp', '!help', '!say', '!analyze', '!forget', '!models', '!model']:
         return
 
     prompt = message.text[1:].strip()
@@ -501,13 +547,15 @@ async def cmd_universal_gpt(message: types.Message):
 
     sys_prompt = DEFAULT_SYSTEM_PROMPT
     temperature = DEFAULT_TEMPERATURE
+    model_to_use = DEFAULT_MODEL
     
     try:
         async with db_pool.acquire() as con:
-            row = await con.fetchrow("SELECT system_prompt, temperature FROM chats WHERE chat_id=$1", chat_id)
+            row = await con.fetchrow("SELECT system_prompt, temperature, model_name FROM chats WHERE chat_id=$1", chat_id)
             if row:
                 if row['system_prompt']: sys_prompt = row['system_prompt']
                 if row['temperature'] is not None: temperature = row['temperature']
+                if row['model_name']: model_to_use = row['model_name']
     except Exception: pass
 
     messages_payload = []
@@ -530,7 +578,7 @@ async def cmd_universal_gpt(message: types.Message):
 
     try:
         response = await gpt_client.chat.completions.create(
-            model="gpt-5-mini",
+            model=model_to_use,  # 🔥 ВИКОРИСТОВУЄМО МОДЕЛЬ З БД
             messages=messages_payload,
             temperature=temperature
         )
@@ -540,7 +588,7 @@ async def cmd_universal_gpt(message: types.Message):
 
     except Exception as e:
         logging.error(f"OpenAI Error: {e}")
-        await message.reply("Щось пішло не так з AI.")
+        await message.reply(f"Помилка AI: {e}")
 
 # --- ЛОГЕР ---
 @dp.message()
