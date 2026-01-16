@@ -277,7 +277,7 @@ async def cb_analyze_run(callback: CallbackQuery):
         
     await callback.message.edit_text("⏳ <b>Читаю думки...</b>", parse_mode=ParseMode.HTML)
     
-    # Витягуємо повідомлення (тільки текст)
+    # Витягуємо текст
     sql = """
         SELECT t.msg_txt
         FROM msg_meta m
@@ -297,7 +297,7 @@ async def cb_analyze_run(callback: CallbackQuery):
         texts = [r['msg_txt'] for r in rows if r['msg_txt'] and str(r['msg_txt']).strip()]
         
         if not texts:
-            await callback.message.edit_text("❌ Цей користувач надсилав лише картинки або стікери.")
+            await callback.message.edit_text("❌ Тільки картинки/стікери, тексту нема.")
             return
 
         text_dump = "\n".join(texts)
@@ -306,22 +306,38 @@ async def cb_analyze_run(callback: CallbackQuery):
         await callback.message.edit_text("Помилка бази даних.")
         return
 
-    sys_instr = "Ти — досвідчений психоаналітик та профайлер. Твоє завдання — скласти психологічний портрет."
-    prompt = f"Проаналізуй повідомлення від {user_name}. Склади психологічний портрет, випиши улюблені слова.\n\n{text_dump}"
+    # Додаємо прохання бути лаконічнішим, але готуємось до довгого тексту
+    sys_instr = "Ти — досвідчений психоаналітик."
+    prompt = f"Проаналізуй повідомлення від {user_name}. Склади психологічний портрет, випиши улюблені слова. Текст для аналізу:\n{text_dump}"
     
     try:
         response = await gpt_client.chat.completions.create(
-            model="gpt-5-mini", 
+            model="gpt-4o-mini", 
             messages=[
                 {"role": "system", "content": sys_instr},
                 {"role": "user", "content": prompt}
             ]
-            # 🔥 ПРИБРАЛИ temperature=0.7, щоб не було помилки 400
+            # Температуру не чіпаємо, хай буде дефолтна (1)
         )
-        await callback.message.edit_text(f"🧠 <b>Аналіз {user_name}:</b>\n\n{response.choices[0].message.content}", parse_mode=ParseMode.MARKDOWN)
+        report = response.choices[0].message.content
+
+        # 🔥 ФІКС ДЛЯ ДОВГИХ ПОВІДОМЛЕНЬ
+        if len(report) > 4000:
+            # Розбиваємо текст на шматки по 4000 символів
+            chunks = [report[i:i+4000] for i in range(0, len(report), 4000)]
+            
+            # Перший шматок редагує "⏳ Читаю думки..."
+            await callback.message.edit_text(f"🧠 <b>Аналіз {user_name} (Частина 1):</b>\n\n{chunks[0]}", parse_mode=ParseMode.MARKDOWN)
+            
+            # Решту шматків відправляємо окремими повідомленнями
+            for i, chunk in enumerate(chunks[1:], start=2):
+                await callback.message.answer(f"🧠 <b>(Частина {i}):</b>\n\n{chunk}", parse_mode=ParseMode.MARKDOWN)
+        else:
+            # Якщо текст влазить, відправляємо як раніше
+            await callback.message.edit_text(f"🧠 <b>Аналіз {user_name}:</b>\n\n{report}", parse_mode=ParseMode.MARKDOWN)
+
     except Exception as e:
         logging.error(f"Analysis AI Error: {e}")
-        # Виводимо точну помилку, якщо знову щось не так
         await callback.message.edit_text(f"⚠️ Помилка AI: {e}")
 
 
