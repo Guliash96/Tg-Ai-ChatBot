@@ -270,15 +270,24 @@ async def cb_analyze_select_count(callback: CallbackQuery):
 async def cb_analyze_run(callback: CallbackQuery):
     parts = callback.data.split("_")
     target_uid, limit, chat_id = int(parts[2]), int(parts[3]), callback.message.chat.id
-    if not gpt_client: await callback.message.edit_text("❌ AI не підключено."); return
+    
+    if not gpt_client: 
+        await callback.message.edit_text("❌ AI не підключено.")
+        return
+        
     await callback.message.edit_text("⏳ <b>Читаю думки...</b>", parse_mode=ParseMode.HTML)
     
+    # Витягуємо повідомлення (тільки текст)
     sql = """
         SELECT t.msg_txt
         FROM msg_meta m
         JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
-        WHERE m.chat_id = $1 AND m.user_id = $2 AND t.msg_txt IS NOT NULL AND t.msg_txt != ''
-        ORDER BY m.date_msg DESC LIMIT $3
+        WHERE m.chat_id = $1 
+          AND m.user_id = $2
+          AND t.msg_txt IS NOT NULL
+          AND t.msg_txt != ''
+        ORDER BY m.date_msg DESC
+        LIMIT $3
     """
     try:
         async with db_pool.acquire() as con:
@@ -286,23 +295,33 @@ async def cb_analyze_run(callback: CallbackQuery):
             user_name = await con.fetchval("SELECT first_name FROM users WHERE user_id=$1", target_uid)
         
         texts = [r['msg_txt'] for r in rows if r['msg_txt'] and str(r['msg_txt']).strip()]
-        if not texts: await callback.message.edit_text("❌ Тільки картинки/стікери."); return
+        
+        if not texts:
+            await callback.message.edit_text("❌ Цей користувач надсилав лише картинки або стікери.")
+            return
+
         text_dump = "\n".join(texts)
     except Exception as e: 
-        await callback.message.edit_text("Помилка БД."); return
+        logging.error(f"DB Error Analyze: {e}")
+        await callback.message.edit_text("Помилка бази даних.")
+        return
 
-    sys_instr = "Ти — досвідчений психоаналітик."
+    sys_instr = "Ти — досвідчений психоаналітик та профайлер. Твоє завдання — скласти психологічний портрет."
     prompt = f"Проаналізуй повідомлення від {user_name}. Склади психологічний портрет, випиши улюблені слова.\n\n{text_dump}"
     
     try:
         response = await gpt_client.chat.completions.create(
             model="gpt-5-mini", 
-            messages=[{"role":"system","content":sys_instr},{"role":"user","content":prompt}], 
-            temperature=0.7
+            messages=[
+                {"role": "system", "content": sys_instr},
+                {"role": "user", "content": prompt}
+            ]
+            # 🔥 ПРИБРАЛИ temperature=0.7, щоб не було помилки 400
         )
         await callback.message.edit_text(f"🧠 <b>Аналіз {user_name}:</b>\n\n{response.choices[0].message.content}", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logging.error(f"Analysis AI Error: {e}")
+        # Виводимо точну помилку, якщо знову щось не так
         await callback.message.edit_text(f"⚠️ Помилка AI: {e}")
 
 
