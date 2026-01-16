@@ -21,7 +21,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = 548789253
 TARGET_CHAT_ID = -1001981383150
 
-# Глибина контексту (ланцюжок)
+# Глибина контексту
 THREAD_DEPTH_LIMIT = 10 
 
 if not API_TOKEN or not NEON_URL:
@@ -64,7 +64,6 @@ async def save_to_db(message: types.Message):
     if not user: return
 
     async with db_pool.acquire() as con:
-        # USERS
         await con.execute("""
             INSERT INTO users (user_id, username, first_name, last_name)
             VALUES ($1, $2, $3, $4)
@@ -72,7 +71,6 @@ async def save_to_db(message: types.Message):
             SET username = EXCLUDED.username, first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name
         """, user.id, user.username, user.first_name, user.last_name)
 
-        # CHATS
         await con.execute("""
             INSERT INTO chats (chat_id, type, title)
             VALUES ($1, $2, $3)
@@ -86,14 +84,12 @@ async def save_to_db(message: types.Message):
         if message.photo: msg_type = 'photo'
         elif message.sticker: msg_type = 'sticker'
 
-        # MSG_META
         await con.execute("""
             INSERT INTO msg_meta (chat_id, msg_id, user_id, date_msg, msg_type, reply_to)
             VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (chat_id, msg_id) DO NOTHING
         """, chat.id, message.message_id, user.id, msg_date, msg_type, reply_to)
 
-        # CONTENT
         if message.text:
             await con.execute("""
                 INSERT INTO msg_txt (chat_id, msg_id, msg_txt)
@@ -132,17 +128,54 @@ async def get_thread_context(chat_id, start_msg_id):
         rows = await con.fetch(sql, chat_id, start_msg_id, THREAD_DEPTH_LIMIT)
         return rows
 
-# --- 🔥 ОНОВЛЕНИЙ ХЕЛПЕР ВІДПРАВКИ (БРОНЕБІЙНИЙ) ---
+# --- 🔥 ХЕЛПЕР: ПЕРЕВІРКА НА "УЗБЕКІВ" ---
+async def check_for_sleeping_uzbeks(message: types.Message):
+    """
+    Перевіряє, чи є в повідомленні теги людей з ignorehere.
+    Якщо є - відправляє попередження.
+    """
+    if not message.entities: return
+
+    mentioned_ids = []
+    mentioned_usernames = []
+
+    for entity in message.entities:
+        if entity.type == 'text_mention':
+            mentioned_ids.append(entity.user.id)
+        elif entity.type == 'mention':
+            # Витягуємо юзернейм без @
+            uname = message.text[entity.offset + 1 : entity.offset + entity.length]
+            mentioned_usernames.append(uname)
+
+    if not mentioned_ids and not mentioned_usernames:
+        return
+
+    chat_id = message.chat.id
+    try:
+        async with db_pool.acquire() as con:
+            sql = """
+                SELECT 1 
+                FROM here_ignore hi
+                LEFT JOIN users u ON hi.user_id = u.user_id
+                WHERE hi.chat_id = $1 
+                  AND (hi.user_id = ANY($2) OR u.username = ANY($3))
+                LIMIT 1
+            """
+            exists = await con.fetchval(sql, chat_id, mentioned_ids, mentioned_usernames)
+            
+            if exists:
+                await message.reply("ЧШШШШ УЗБЕКІ СПЯТЬ")
+    except Exception as e:
+        logging.error(f"Mention Check Error: {e}")
+
+
+# --- ХЕЛПЕР ВІДПРАВКИ (БРОНЕБІЙНИЙ) ---
 async def send_chunked_response(message_obj, text):
-    """
-    Розбиває текст і відправляє. Якщо Markdown ламається — шле текстом.
-    """
     async def send_safe(chunk):
         try:
             return await message_obj.answer(chunk, parse_mode=ParseMode.MARKDOWN)
         except Exception:
             try:
-                # Fallback: пробуємо без форматування
                 return await message_obj.answer(chunk, parse_mode=None)
             except Exception as e:
                 logging.error(f"Failed to send chunk: {e}")
@@ -432,7 +465,6 @@ async def cb_user_details(callback: CallbackQuery):
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=builder.as_markup())
     await callback.answer()
 
-# --- СПЕЦІАЛЬНІ КОМАНДИ ---
 @dp.message(F.text.lower().startswith('!ignorehere'))
 async def cmd_ignore_here(message: types.Message):
     await save_to_db(message)
@@ -453,13 +485,11 @@ async def cmd_help(message: types.Message):
             "🔕 <b>!ignorehere</b> — Сховатися від !here\n🎲 <b>!roulette</b> — Рулетка")
     await message.answer(text, parse_mode=ParseMode.HTML)
 
-# 🔥 ОНОВЛЕНА РУЛЕТКА (З урахуванням ignorehere)
 @dp.message(F.text.lower().startswith('!roulette'))
 async def cmd_roulette(message: types.Message):
     if message.chat.type == 'private': return 
     await save_to_db(message)
     chat_id = message.chat.id
-    # LEFT JOIN фільтрує тих, хто в ignorehere
     sql = """
         SELECT * FROM (
             SELECT DISTINCT u.user_id, u.username, u.first_name
@@ -495,51 +525,12 @@ async def cmd_remote_say(message: types.Message):
     except: pass
 
 # ==========================================
-# 🔥 НОВИЙ ХЕНДЛЕР: ЗАХИСТ ВІД ТЕГІВ "УЗБЕКІВ"
+# 🔥 НОВИЙ ХЕНДЛЕР: ОРЕ НА ТИХ, ХТО ТЕГАЄ УЗБЕКІВ
 # ==========================================
-@dp.message(F.entities)
-async def check_mentions_handler(message: types.Message):
-    # Спочатку збережемо, щоб не втратити
+@dp.message(F.entities & ~F.text.startswith('!'))
+async def mention_only_handler(message: types.Message):
     await save_to_db(message)
-    
-    mentioned_ids = []
-    mentioned_usernames = []
-
-    for entity in message.entities:
-        if entity.type == 'text_mention':
-            mentioned_ids.append(entity.user.id)
-        elif entity.type == 'mention':
-            # Витягуємо юзернейм без @
-            uname = message.text[entity.offset + 1 : entity.offset + entity.length]
-            mentioned_usernames.append(uname)
-
-    if not mentioned_ids and not mentioned_usernames:
-        return # Нема кого перевіряти
-
-    chat_id = message.chat.id
-    
-    # Перевіряємо, чи є згадані люди в списку ігнору
-    try:
-        async with db_pool.acquire() as con:
-            sql = """
-                SELECT 1 
-                FROM here_ignore hi
-                LEFT JOIN users u ON hi.user_id = u.user_id
-                WHERE hi.chat_id = $1 
-                  AND (hi.user_id = ANY($2) OR u.username = ANY($3))
-                LIMIT 1
-            """
-            exists = await con.fetchval(sql, chat_id, mentioned_ids, mentioned_usernames)
-            
-            if exists:
-                await message.reply("ЧШШШШ УЗБЕКІ СПЯТЬ")
-    except Exception as e:
-        logging.error(f"Mention Check Error: {e}")
-
-    # Важливо: ми не робимо return, щоб повідомлення пішло далі 
-    # (наприклад, якщо це команда !gpt з тегом, вона все одно має спрацювати, 
-    # або якщо це просто повідомлення, воно піде в лог)
-
+    await check_for_sleeping_uzbeks(message)
 
 # ==========================================
 # УНІВЕРСАЛЬНИЙ GPT ХЕНДЛЕР (В КІНЦІ)
@@ -547,6 +538,10 @@ async def check_mentions_handler(message: types.Message):
 @dp.message(F.text.startswith('!'))
 async def cmd_universal_gpt(message: types.Message):
     await save_to_db(message)
+    
+    # 🔥 СПОЧАТКУ ПЕРЕВІРЯЄМО, ЧИ НЕ ТЕГНУЛИ УЗБЕКІВ
+    await check_for_sleeping_uzbeks(message)
+    
     if not gpt_client: return
     
     command_word = message.text.split()[0].lower()
@@ -577,7 +572,6 @@ async def cmd_universal_gpt(message: types.Message):
     if sys_prompt:
         messages_payload.append({"role": "system", "content": sys_prompt})
 
-    # 🔥 ТЕПЕР ТІЛЬКИ РЕПЛАЙ-ЛАНЦЮЖОК
     try:
         history_rows = await get_thread_context(chat_id, message.message_id)
         
