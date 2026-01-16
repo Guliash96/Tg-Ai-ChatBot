@@ -122,7 +122,7 @@ async def get_focused_history(chat_id, bot_id):
             WHERE m.chat_id = $1 AND m.user_id = $2
               AND t.msg_txt NOT LIKE '✅%' AND t.msg_txt NOT LIKE '🧠%'
               AND t.msg_txt NOT LIKE '🔄%' AND t.msg_txt NOT LIKE '⚠️%'
-              AND t.msg_txt NOT LIKE '💾%'
+              AND t.msg_txt NOT LIKE '💾%' AND t.msg_txt NOT LIKE '👻%'
             ORDER BY m.date_msg DESC LIMIT $3
         """
         rows_from = await con.fetch(sql_from_bot, chat_id, bot_id, HISTORY_LIMIT_FROM_BOT)
@@ -139,7 +139,7 @@ async def get_focused_history(chat_id, bot_id):
               AND t.msg_txt NOT LIKE '!system%' AND t.msg_txt NOT LIKE '!temp%'
               AND t.msg_txt NOT LIKE '!clearsystem%' AND t.msg_txt NOT LIKE '!forget%'
               AND t.msg_txt NOT LIKE '!analyze%' AND t.msg_txt NOT LIKE '!model%'
-              AND t.msg_txt NOT LIKE '!models%'
+              AND t.msg_txt NOT LIKE '!models%' AND t.msg_txt NOT LIKE '!ignorehere%'
             ORDER BY m.date_msg DESC LIMIT $3
         """
         rows_to = await con.fetch(sql_to_bot, chat_id, bot_id, HISTORY_LIMIT_TO_BOT)
@@ -228,7 +228,6 @@ async def cmd_models_menu(message: types.Message):
     await save_to_db(message)
     chat_id = message.chat.id
     
-    # Дізнаємось поточну модель
     async with db_pool.acquire() as con:
         current_model = await con.fetchval("SELECT model_name FROM chats WHERE chat_id=$1", chat_id)
     
@@ -238,7 +237,6 @@ async def cmd_models_menu(message: types.Message):
     
     builder = InlineKeyboardBuilder()
     for model in AVAILABLE_MODELS:
-        # Додаємо галочку до активної моделі
         label = f"✅ {model}" if model == current_model else model
         builder.button(text=label, callback_data=f"set_mdl_{model}")
         
@@ -257,9 +255,6 @@ async def cb_set_model(callback: CallbackQuery):
     try:
         async with db_pool.acquire() as con:
             await con.execute("UPDATE chats SET model_name=$1 WHERE chat_id=$2", selected_model, chat_id)
-        
-        # Оновлюємо текст повідомлення, щоб показати нову галочку
-        # Для цього треба перевикликати логіку формування меню, але простіше просто написати "Готово"
         await callback.message.edit_text(f"💾 <b>Встановлено модель:</b> <code>{selected_model}</code>", parse_mode=ParseMode.HTML)
     except Exception as e:
         await callback.message.edit_text(f"Помилка БД: {e}")
@@ -297,7 +292,6 @@ async def cb_analyze_select_count(callback: CallbackQuery):
     builder.button(text="📝 25", callback_data=f"anlz_run_{target_uid}_25")
     builder.button(text="📝 50", callback_data=f"anlz_run_{target_uid}_50")
     builder.button(text="📝 100", callback_data=f"anlz_run_{target_uid}_100")
-    # Додаємо кнопку 1000
     builder.button(text="📝 1000 (VIP/24h)", callback_data=f"anlz_run_{target_uid}_1000")
     builder.adjust(2)
     await callback.message.edit_text("🔢 <b>Скільки повідомлень?</b>", parse_mode=ParseMode.HTML, reply_markup=builder.as_markup())
@@ -310,7 +304,6 @@ async def cb_analyze_run(callback: CallbackQuery):
     
     if not gpt_client: await callback.message.edit_text("❌ AI не підключено."); return
 
-    # Перевірка ліміту
     if limit == 1000 and caller_id != ADMIN_ID:
         try:
             async with db_pool.acquire() as con:
@@ -355,9 +348,8 @@ async def cb_analyze_run(callback: CallbackQuery):
     
     try:
         response = await gpt_client.chat.completions.create(
-            model=current_model, # Використовуємо вибрану модель!
+            model=current_model,
             messages=[{"role":"system","content":sys_instr},{"role":"user","content":prompt}]
-            # Temperature за замовчуванням (1.0), параметр не передаємо
         )
         report = response.choices[0].message.content
 
@@ -475,7 +467,25 @@ async def cb_user_details(callback: CallbackQuery):
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=builder.as_markup())
     await callback.answer()
 
-# --- ІНШІ КОМАНДИ ---
+# --- СПЕЦІАЛЬНІ КОМАНДИ ---
+@dp.message(F.text.lower().startswith('!ignorehere'))
+async def cmd_ignore_here(message: types.Message):
+    await save_to_db(message)
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # Спроба видалити запис (якщо юзер вже в ігнорі -> він хоче повернутись)
+    async with db_pool.acquire() as con:
+        result = await con.execute("DELETE FROM here_ignore WHERE chat_id=$1 AND user_id=$2", chat_id, user_id)
+        
+        if result == "DELETE 1":
+            # Видалили -> Значить він був в ігнорі, тепер активний
+            await message.answer("👻 <b>Ти знову в грі!</b> Тепер тебе буде тегати в !here.", parse_mode=ParseMode.HTML)
+        else:
+            # Не видалили -> Значить його не було, додаємо
+            await con.execute("INSERT INTO here_ignore (chat_id, user_id) VALUES ($1, $2)", chat_id, user_id)
+            await message.answer("🔕 <b>Режим невидимки:</b> Тебе більше не буде тегати в !here в цьому чаті.", parse_mode=ParseMode.HTML)
+
 
 @dp.message(F.text.lower().startswith('!help'))
 async def cmd_help(message: types.Message):
@@ -490,7 +500,8 @@ async def cmd_help(message: types.Message):
         "🧹 <b>!forget</b> — Очистити пам'ять бота (забути діалог).\n"
         "🌡 <b>!temp [0.0-2.0]</b> — Креативність (1.0 = стандарт).\n"
         "📊 <b>!stats</b> — Детальна статистика чату.\n"
-        "📢 <b>!here</b> — Тегнути всіх, хто писав у чаті.\n"
+        "📢 <b>!here</b> — Тегнути всіх активних (крім тих, хто сховався).\n"
+        "🔕 <b>!ignorehere</b> — Сховатися/показатися для команди !here.\n"
         "🎲 <b>!roulette</b> — Російська рулетка (вибір жертви)."
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
@@ -508,17 +519,31 @@ async def cmd_roulette(message: types.Message):
         await message.answer(f"{m} - НУ ТИ І ПІДАРАС", parse_mode=ParseMode.HTML)
     except: pass
 
+# 🔥 ОНОВЛЕНИЙ !here З ФІЛЬТРАЦІЄЮ ІГНОРУ
 @dp.message(F.text.lower().startswith('!here'))
 async def cmd_here(message: types.Message):
     await save_to_db(message)
     chat_id = message.chat.id
-    sql = "SELECT DISTINCT u.user_id, u.username, u.first_name FROM users u JOIN msg_meta m ON u.user_id = m.user_id WHERE m.chat_id = $1"
+    
+    # Беремо всіх активних, АЛЕ фільтруємо через LEFT JOIN тих, хто є в here_ignore
+    sql = """
+        SELECT DISTINCT u.user_id, u.username, u.first_name 
+        FROM users u 
+        JOIN msg_meta m ON u.user_id = m.user_id 
+        LEFT JOIN here_ignore hi ON u.user_id = hi.user_id AND m.chat_id = hi.chat_id
+        WHERE m.chat_id = $1 AND hi.user_id IS NULL
+    """
     try:
         async with db_pool.acquire() as con: rows = await con.fetch(sql, chat_id)
         if not rows: return
         mentions = [f"@{r['username']}" if r['username'] else f"<a href='tg://user?id={r['user_id']}'>{r['first_name']}</a>" for r in rows]
+        
+        if not mentions:
+            await message.answer("👀 Всі сховалися (або нікого немає).")
+            return
+            
         await message.answer("📢 <b>ОБЩИЙ СБОР</b>\n\n" + " ".join(mentions), parse_mode=ParseMode.HTML)
-    except: await message.answer("Забагато людей.")
+    except: await message.answer("Забагато людей або помилка.")
 
 @dp.message(F.text.startswith('!say') & (F.chat.type == 'private'))
 async def cmd_remote_say(message: types.Message):
@@ -535,7 +560,7 @@ async def cmd_universal_gpt(message: types.Message):
     if not gpt_client: return
     
     command_word = message.text.split()[0].lower()
-    if command_word in ['!here', '!stats', '!roulette', '!system', '!clearsystem', '!temp', '!help', '!say', '!analyze', '!forget', '!models', '!model']:
+    if command_word in ['!here', '!stats', '!roulette', '!system', '!clearsystem', '!temp', '!help', '!say', '!analyze', '!forget', '!models', '!model', '!ignorehere']:
         return
 
     prompt = message.text[1:].strip()
