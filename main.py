@@ -21,9 +21,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = 548789253
 TARGET_CHAT_ID = -1001981383150
 
-# Налаштування пам'яті
-HISTORY_LIMIT_FROM_BOT = 5
-HISTORY_LIMIT_TO_BOT = 5
+# Глибина ланцюжка (всього 10 повідомлень: ~5 твоїх, ~5 бота)
+THREAD_DEPTH_LIMIT = 10 
 
 if not API_TOKEN or not NEON_URL:
     print("❌ ПОМИЛКА: Перевір .env файл")
@@ -37,12 +36,10 @@ db_pool = None
 
 gpt_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# 🔥 НАЛАШТУВАННЯ ЗА ЗАМОВЧУВАННЯМ
 DEFAULT_SYSTEM_PROMPT = None 
 DEFAULT_TEMPERATURE = 1.0  
 DEFAULT_MODEL = "gpt-5-mini" 
 
-# Список доступних моделей
 AVAILABLE_MODELS = [
     "gpt-5-mini",
     "gpt-5.2-chat-latest",
@@ -110,44 +107,53 @@ async def save_to_db(message: types.Message):
                 ON CONFLICT (chat_id, msg_id) DO NOTHING
             """, chat.id, message.message_id, photo.file_id, message.caption)
 
-# --- ЛОГІКА ІСТОРІЇ ---
-async def get_focused_history(chat_id, bot_id):
+# --- 🔥 НОВА ЛОГІКА: РЕКУРСИВНИЙ ЛАНЦЮЖОК ---
+async def get_thread_context(chat_id, start_msg_id):
+    """
+    Витягує ланцюжок повідомлень (Thread) використовуючи reply_to.
+    Йде від поточного повідомлення вгору до батьків.
+    """
     async with db_pool.acquire() as con:
-        # 1. Повідомлення ВІД бота
-        sql_from_bot = """
-            SELECT m.msg_id, m.user_id, m.date_msg, t.msg_txt, u.first_name
-            FROM msg_meta m
-            JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
-            LEFT JOIN users u ON m.user_id = u.user_id
-            WHERE m.chat_id = $1 AND m.user_id = $2
-              AND t.msg_txt NOT LIKE '✅%' AND t.msg_txt NOT LIKE '🧠%'
-              AND t.msg_txt NOT LIKE '🔄%' AND t.msg_txt NOT LIKE '⚠️%'
-              AND t.msg_txt NOT LIKE '💾%' AND t.msg_txt NOT LIKE '👻%'
-            ORDER BY m.date_msg DESC LIMIT $3
+        # Рекурсивний CTE запит
+        sql = """
+            WITH RECURSIVE thread AS (
+                -- 1. Початкова точка (поточне повідомлення)
+                SELECT m.msg_id, m.reply_to, m.user_id, m.date_msg, t.msg_txt, 1 as depth
+                FROM msg_meta m
+                JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
+                WHERE m.chat_id = $1 AND m.msg_id = $2
+
+                UNION ALL
+
+                -- 2. Рекурсивний крок (шукаємо батька)
+                SELECT parent.msg_id, parent.reply_to, parent.user_id, parent.date_msg, pt.msg_txt, thread.depth + 1
+                FROM msg_meta parent
+                JOIN msg_txt pt ON parent.chat_id = pt.chat_id AND parent.msg_id = pt.msg_id
+                JOIN thread ON thread.reply_to = parent.msg_id
+                WHERE parent.chat_id = $1 AND thread.depth < $3
+            )
+            -- 3. Вибираємо результат і додаємо імена юзерів
+            SELECT thread.*, u.first_name 
+            FROM thread
+            LEFT JOIN users u ON thread.user_id = u.user_id
+            ORDER BY thread.date_msg ASC;
         """
-        rows_from = await con.fetch(sql_from_bot, chat_id, bot_id, HISTORY_LIMIT_FROM_BOT)
+        rows = await con.fetch(sql, chat_id, start_msg_id, THREAD_DEPTH_LIMIT)
+        return rows
 
-        # 2. Повідомлення ДО бота
-        sql_to_bot = """
-            SELECT m.msg_id, m.user_id, m.date_msg, t.msg_txt, u.first_name
-            FROM msg_meta m
-            JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
-            LEFT JOIN users u ON m.user_id = u.user_id
-            LEFT JOIN msg_meta parent ON m.chat_id = parent.chat_id AND m.reply_to = parent.msg_id
-            WHERE m.chat_id = $1 AND m.user_id != $2
-              AND (parent.user_id = $2 OR t.msg_txt LIKE '!%')
-              AND t.msg_txt NOT LIKE '!system%' AND t.msg_txt NOT LIKE '!temp%'
-              AND t.msg_txt NOT LIKE '!clearsystem%' AND t.msg_txt NOT LIKE '!forget%'
-              AND t.msg_txt NOT LIKE '!analyze%' AND t.msg_txt NOT LIKE '!model%'
-              AND t.msg_txt NOT LIKE '!models%' AND t.msg_txt NOT LIKE '!ignorehere%'
-            ORDER BY m.date_msg DESC LIMIT $3
-        """
-        rows_to = await con.fetch(sql_to_bot, chat_id, bot_id, HISTORY_LIMIT_TO_BOT)
+# --- 🔥 ХЕЛПЕР ДЛЯ РОЗБИТТЯ ПОВІДОМЛЕНЬ ---
+async def send_chunked_response(message_obj, text):
+    """Розбиває текст на шматки по 4000 символів і відправляє"""
+    if len(text) <= 4000:
+        sent = await message_obj.reply(text, parse_mode=ParseMode.MARKDOWN)
+        await save_to_db(sent)
+    else:
+        chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        for chunk in chunks:
+            sent = await message_obj.answer(chunk, parse_mode=ParseMode.MARKDOWN)
+            await save_to_db(sent)
 
-    all_rows = rows_from + rows_to
-    all_rows.sort(key=lambda r: r['date_msg'])
-    return all_rows
-
+# --- ДОПОМІЖНІ ---
 def get_cutoff_date(period_code):
     now = datetime.utcnow()
     if period_code == '1d': return now - timedelta(days=1)
@@ -163,7 +169,7 @@ def get_period_name(period_code):
 
 
 # ==========================================
-# ХЕНДЛЕРИ НАЛАШТУВАНЬ
+# ХЕНДЛЕРИ СИСТЕМИ
 # ==========================================
 
 @dp.message(F.text.startswith('!system'))
@@ -198,7 +204,7 @@ async def cmd_clear_system(message: types.Message):
 @dp.message(F.text.lower().startswith('!forget'))
 async def cmd_forget(message: types.Message):
     await save_to_db(message)
-    await message.answer("🧹 <b>Контекст 'освіжено'.</b> Я більше не враховую попередні повідомлення в діалозі.", parse_mode=ParseMode.HTML)
+    await message.answer("🧹 <b>Контекст 'освіжено'.</b> (Це візуальна команда, справжній контекст тепер залежить від того, на яке повідомлення ти відповідаєш).", parse_mode=ParseMode.HTML)
 
 @dp.message(F.text.lower().startswith('!temp'))
 async def cmd_set_temp(message: types.Message):
@@ -222,7 +228,7 @@ async def cmd_set_temp(message: types.Message):
     except ValueError:
         await message.answer("❌ Введи число (наприклад 1.0).")
 
-# 🔥 КОМАНДА: !models (ВИБІР МОДЕЛІ)
+# 🔥 КОМАНДА: !models
 @dp.message(F.text.lower().startswith('!models') | F.text.lower().startswith('!model'))
 async def cmd_models_menu(message: types.Message):
     await save_to_db(message)
@@ -261,7 +267,7 @@ async def cb_set_model(callback: CallbackQuery):
 
 
 # ==========================================
-# ХЕНДЛЕРИ АНАЛІЗУ (!analyze) З ЛІМІТОМ
+# ХЕНДЛЕРИ АНАЛІЗУ (!analyze)
 # ==========================================
 @dp.message(F.text.lower().startswith('!analyze'))
 async def cmd_analyze_menu(message: types.Message):
@@ -269,12 +275,8 @@ async def cmd_analyze_menu(message: types.Message):
     chat_id = message.chat.id
     sql = """
         SELECT u.user_id, u.first_name, COUNT(m.msg_id) as cnt
-        FROM msg_meta m 
-        JOIN users u ON m.user_id = u.user_id
-        JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
-        WHERE m.chat_id = $1
-        GROUP BY u.user_id, u.first_name
-        ORDER BY cnt DESC LIMIT 20
+        FROM msg_meta m JOIN users u ON m.user_id = u.user_id JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
+        WHERE m.chat_id = $1 GROUP BY u.user_id, u.first_name ORDER BY cnt DESC LIMIT 20
     """
     try:
         async with db_pool.acquire() as con: rows = await con.fetch(sql, chat_id)
@@ -313,9 +315,9 @@ async def cb_analyze_run(callback: CallbackQuery):
                     now = datetime.utcnow()
                     if now < next_run:
                         diff = next_run - now
-                        hours, remainder = divmod(diff.seconds, 3600)
-                        minutes, _ = divmod(remainder, 60)
-                        await callback.answer(f"⛔ Ліміт вичерпано!\nЧекай: {hours}год {minutes}хв", show_alert=True)
+                        h, r = divmod(diff.seconds, 3600)
+                        m, _ = divmod(r, 60)
+                        await callback.answer(f"⛔ Ліміт! Чекай: {h}год {m}хв", show_alert=True)
                         return
                 await con.execute("UPDATE users SET last_1000_analyze=$1 WHERE user_id=$2", datetime.utcnow(), caller_id)
         except Exception as e: logging.error(f"Limit Error: {e}")
@@ -323,9 +325,7 @@ async def cb_analyze_run(callback: CallbackQuery):
     await callback.message.edit_text("⏳ <b>Збираю архів...</b>", parse_mode=ParseMode.HTML)
     
     sql = """
-        SELECT t.msg_txt
-        FROM msg_meta m
-        JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
+        SELECT t.msg_txt FROM msg_meta m JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
         WHERE m.chat_id = $1 AND m.user_id = $2 AND t.msg_txt IS NOT NULL AND t.msg_txt != ''
         ORDER BY m.date_msg DESC LIMIT $3
     """
@@ -334,40 +334,31 @@ async def cb_analyze_run(callback: CallbackQuery):
             rows = await con.fetch(sql, chat_id, target_uid, limit)
             user_name = await con.fetchval("SELECT first_name FROM users WHERE user_id=$1", target_uid)
             chat_model = await con.fetchval("SELECT model_name FROM chats WHERE chat_id=$1", chat_id)
-            
+        
         current_model = chat_model if chat_model else DEFAULT_MODEL
-
         texts = [r['msg_txt'] for r in rows if r['msg_txt'] and str(r['msg_txt']).strip()]
         if not texts: await callback.message.edit_text("❌ Тільки картинки/стікери."); return
         text_dump = "\n".join(texts)
-    except Exception as e: 
-        await callback.message.edit_text("Помилка БД."); return
+    except Exception as e: await callback.message.edit_text("Помилка БД."); return
 
     sys_instr = "Ти — досвідчений психоаналітик."
     prompt = f"Проаналізуй повідомлення від {user_name}. Склади детальний портрет. Текст:\n{text_dump}"
     
     try:
         response = await gpt_client.chat.completions.create(
-            model=current_model,
-            messages=[{"role":"system","content":sys_instr},{"role":"user","content":prompt}]
+            model=current_model, messages=[{"role":"system","content":sys_instr},{"role":"user","content":prompt}]
         )
-        report = response.choices[0].message.content
-
-        if len(report) > 4000:
-            chunks = [report[i:i+4000] for i in range(0, len(report), 4000)]
-            await callback.message.edit_text(f"🧠 <b>Аналіз {user_name} (1):</b>\n\n{chunks[0]}", parse_mode=ParseMode.MARKDOWN)
-            for i, chunk in enumerate(chunks[1:], start=2):
-                await callback.message.answer(f"🧠 <b>(Частина {i}):</b>\n\n{chunk}", parse_mode=ParseMode.MARKDOWN)
-        else:
-            await callback.message.edit_text(f"🧠 <b>Аналіз {user_name}:</b>\n\n{report}", parse_mode=ParseMode.MARKDOWN)
+        # Використовуємо універсальну функцію для відправки
+        await callback.message.delete() # Видаляємо "Збираю архів"
+        await send_chunked_response(callback.message, f"🧠 <b>Аналіз {user_name}:</b>\n\n{response.choices[0].message.content}")
 
     except Exception as e:
         logging.error(f"Analysis AI Error: {e}")
-        await callback.message.edit_text(f"⚠️ Помилка AI: {e}")
+        await callback.message.answer(f"⚠️ Помилка AI: {e}")
 
 
 # ==========================================
-# ХЕНДЛЕРИ СТАТИСТИКИ (БЕЗ ЗМІН)
+# ХЕНДЛЕРИ СТАТИСТИКИ ТА ІНШЕ (Без змін)
 # ==========================================
 @dp.message(F.text.lower().startswith('!stats'))
 async def cmd_stats_menu(message: types.Message):
@@ -467,43 +458,24 @@ async def cb_user_details(callback: CallbackQuery):
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=builder.as_markup())
     await callback.answer()
 
-# --- СПЕЦІАЛЬНІ КОМАНДИ ---
 @dp.message(F.text.lower().startswith('!ignorehere'))
 async def cmd_ignore_here(message: types.Message):
     await save_to_db(message)
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    
-    # Спроба видалити запис (якщо юзер вже в ігнорі -> він хоче повернутись)
+    user_id, chat_id = message.from_user.id, message.chat.id
     async with db_pool.acquire() as con:
-        result = await con.execute("DELETE FROM here_ignore WHERE chat_id=$1 AND user_id=$2", chat_id, user_id)
-        
-        if result == "DELETE 1":
-            # Видалили -> Значить він був в ігнорі, тепер активний
-            await message.answer("👻 <b>Ти знову в грі!</b> Тепер тебе буде тегати в !here.", parse_mode=ParseMode.HTML)
+        res = await con.execute("DELETE FROM here_ignore WHERE chat_id=$1 AND user_id=$2", chat_id, user_id)
+        if res == "DELETE 1": await message.answer("👻 <b>Ти знову в грі!</b>", parse_mode=ParseMode.HTML)
         else:
-            # Не видалили -> Значить його не було, додаємо
             await con.execute("INSERT INTO here_ignore (chat_id, user_id) VALUES ($1, $2)", chat_id, user_id)
-            await message.answer("🔕 <b>Режим невидимки:</b> Тебе більше не буде тегати в !here в цьому чаті.", parse_mode=ParseMode.HTML)
-
+            await message.answer("🔕 <b>Режим невидимки ввімкнено.</b>", parse_mode=ParseMode.HTML)
 
 @dp.message(F.text.lower().startswith('!help'))
 async def cmd_help(message: types.Message):
     await save_to_db(message)
-    text = (
-        "🤖 <b>Довідка по командам:</b>\n\n"
-        "💬 <b>!текст</b> — Питання до ШІ (відповідає обрана модель).\n"
-        "💾 <b>!models</b> — Меню вибору моделі (gpt-5-mini, pro).\n"
-        "🕵️‍♂️ <b>!analyze</b> — Меню психоаналізу учасників чату.\n"
-        "🧠 <b>!system [текст]</b> — Задати особистість/роль бота.\n"
-        "🔄 <b>!clearsystem</b> — Скинути особистість до заводських.\n"
-        "🧹 <b>!forget</b> — Очистити пам'ять бота (забути діалог).\n"
-        "🌡 <b>!temp [0.0-2.0]</b> — Креативність (1.0 = стандарт).\n"
-        "📊 <b>!stats</b> — Детальна статистика чату.\n"
-        "📢 <b>!here</b> — Тегнути всіх активних (крім тих, хто сховався).\n"
-        "🔕 <b>!ignorehere</b> — Сховатися/показатися для команди !here.\n"
-        "🎲 <b>!roulette</b> — Російська рулетка (вибір жертви)."
-    )
+    text = ("🤖 <b>Команди:</b>\n💬 <b>!текст</b> — GPT\n💾 <b>!models</b> — Вибір моделі\n🕵️‍♂️ <b>!analyze</b> — Психоаналіз\n"
+            "🧠 <b>!system</b> — Особистість\n🔄 <b>!clearsystem</b> — Скидання\n🧹 <b>!forget</b> — Очистка контексту\n"
+            "🌡 <b>!temp</b> — Креативність\n📊 <b>!stats</b> — Статистика\n📢 <b>!here</b> — Всіх тегнути\n"
+            "🔕 <b>!ignorehere</b> — Сховатися від !here\n🎲 <b>!roulette</b> — Рулетка")
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 @dp.message(F.text.lower().startswith('!roulette'))
@@ -519,31 +491,17 @@ async def cmd_roulette(message: types.Message):
         await message.answer(f"{m} - НУ ТИ І ПІДАРАС", parse_mode=ParseMode.HTML)
     except: pass
 
-# 🔥 ОНОВЛЕНИЙ !here З ФІЛЬТРАЦІЄЮ ІГНОРУ
 @dp.message(F.text.lower().startswith('!here'))
 async def cmd_here(message: types.Message):
     await save_to_db(message)
     chat_id = message.chat.id
-    
-    # Беремо всіх активних, АЛЕ фільтруємо через LEFT JOIN тих, хто є в here_ignore
-    sql = """
-        SELECT DISTINCT u.user_id, u.username, u.first_name 
-        FROM users u 
-        JOIN msg_meta m ON u.user_id = m.user_id 
-        LEFT JOIN here_ignore hi ON u.user_id = hi.user_id AND m.chat_id = hi.chat_id
-        WHERE m.chat_id = $1 AND hi.user_id IS NULL
-    """
+    sql = "SELECT DISTINCT u.user_id, u.username, u.first_name FROM users u JOIN msg_meta m ON u.user_id = m.user_id LEFT JOIN here_ignore hi ON u.user_id = hi.user_id AND m.chat_id = hi.chat_id WHERE m.chat_id = $1 AND hi.user_id IS NULL"
     try:
         async with db_pool.acquire() as con: rows = await con.fetch(sql, chat_id)
-        if not rows: return
+        if not rows: await message.answer("👀 Всі сховалися."); return
         mentions = [f"@{r['username']}" if r['username'] else f"<a href='tg://user?id={r['user_id']}'>{r['first_name']}</a>" for r in rows]
-        
-        if not mentions:
-            await message.answer("👀 Всі сховалися (або нікого немає).")
-            return
-            
         await message.answer("📢 <b>ОБЩИЙ СБОР</b>\n\n" + " ".join(mentions), parse_mode=ParseMode.HTML)
-    except: await message.answer("Забагато людей або помилка.")
+    except: await message.answer("Забагато людей.")
 
 @dp.message(F.text.startswith('!say') & (F.chat.type == 'private'))
 async def cmd_remote_say(message: types.Message):
@@ -587,8 +545,11 @@ async def cmd_universal_gpt(message: types.Message):
     if sys_prompt:
         messages_payload.append({"role": "system", "content": sys_prompt})
 
+    # 🔥 ВИКОРИСТОВУЄМО НОВИЙ THREAD CONTEXT
     try:
-        history_rows = await get_focused_history(chat_id, bot_id)
+        # Передаємо message_id поточного повідомлення, щоб знайти його предків
+        history_rows = await get_thread_context(chat_id, message.message_id)
+        
         for row in history_rows:
             uid = row['user_id']
             text = row['msg_txt']
@@ -603,13 +564,14 @@ async def cmd_universal_gpt(message: types.Message):
 
     try:
         response = await gpt_client.chat.completions.create(
-            model=model_to_use,  # 🔥 ВИКОРИСТОВУЄМО МОДЕЛЬ З БД
+            model=model_to_use, 
             messages=messages_payload,
             temperature=temperature
         )
         reply_text = response.choices[0].message.content
-        sent_msg = await message.reply(reply_text)
-        await save_to_db(sent_msg)
+        
+        # 🔥 ВИКОРИСТОВУЄМО ФУНКЦІЮ РОЗБИТТЯ ДЛЯ ВІДПОВІДІ
+        await send_chunked_response(message, reply_text)
 
     except Exception as e:
         logging.error(f"OpenAI Error: {e}")
