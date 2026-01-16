@@ -38,7 +38,7 @@ db_pool = None
 gpt_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 DEFAULT_SYSTEM_PROMPT = None 
-DEFAULT_TEMPERATURE = 0.7
+DEFAULT_TEMPERATURE = 1
 
 # --- БАЗА ДАНИХ ---
 async def create_pool():
