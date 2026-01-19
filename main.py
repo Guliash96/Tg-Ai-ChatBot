@@ -374,10 +374,9 @@ async def cmd_psearch(message: types.Message):
     await message.bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
 
     try:
-        # safesearch='off' - БЕЗПЕЧНИЙ ПОШУК ВИМКНЕНО
-        # shuffle прибрано, результати в порядку релевантності
+        # 🔥 ЛІМІТ 20 КАРТИНОК, ЩОБ НЕ ОТРИМАТИ БАН (403)
         with DDGS() as ddgs:
-            results = list(ddgs.images(query, max_results=150, safesearch='off'))
+            results = list(ddgs.images(query, max_results=20, safesearch='off'))
         
         if not results:
             await message.reply("На жаль, нічого не знайдено.")
