@@ -2,4 +2,5 @@ aiogram
 openai
 python-dotenv
 asyncpg
-duckduckgo-search>=6.1.0
+requests
+fake-useragent
