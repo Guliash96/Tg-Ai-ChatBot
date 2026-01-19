@@ -2,5 +2,3 @@ aiogram
 openai
 python-dotenv
 asyncpg
-requests
-fake-useragent

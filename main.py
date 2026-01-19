@@ -4,15 +4,11 @@ import os
 import sys
 import asyncpg
 import random
-import uuid
-import re # <--- Для пошуку посилань у коді Google
-import requests # <--- Для запитів
-from fake_useragent import UserAgent # <--- Щоб дурити Google
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import CallbackQuery, InputMediaPhoto
+from aiogram.types import CallbackQuery
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -26,6 +22,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = 548789253
 TARGET_CHAT_ID = -1001981383150
 
+# Глибина рекурсії (скільки реплаїв назад пам'ятати)
 THREAD_DEPTH_LIMIT = 10 
 
 if not API_TOKEN or not NEON_URL:
@@ -49,9 +46,6 @@ AVAILABLE_MODELS = [
     "gpt-5.2-chat-latest",
     "gpt-5-pro"
 ]
-
-# Сховище результатів пошуку
-SEARCH_RESULTS = {}
 
 # --- БАЗА ДАНИХ ---
 async def create_pool():
@@ -110,18 +104,22 @@ async def save_to_db(message: types.Message):
                 ON CONFLICT (chat_id, msg_id) DO NOTHING
             """, chat.id, message.message_id, photo.file_id, message.caption)
 
-# --- ЛОГІКА ІСТОРІЇ ---
+# --- 🔥 ЛОГІКА ІСТОРІЇ (РЕПЛАЙ-ЛАНЦЮЖКИ) ---
 async def get_thread_context(chat_id, start_msg_id):
     async with db_pool.acquire() as con:
         sql = """
             WITH RECURSIVE thread AS (
+                -- 1. Стартове повідомлення
                 SELECT m.msg_id, m.reply_to, m.user_id, m.date_msg, 
                        t.msg_txt, p.photo_url as file_id, 1 as depth
                 FROM msg_meta m
                 LEFT JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
                 LEFT JOIN photo p ON m.chat_id = p.chat_id AND m.msg_id = p.msg_id
                 WHERE m.chat_id = $1 AND m.msg_id = $2
+
                 UNION ALL
+
+                -- 2. Рекурсивний пошук "батьків"
                 SELECT parent.msg_id, parent.reply_to, parent.user_id, parent.date_msg, 
                        pt.msg_txt, pp.photo_url as file_id, thread.depth + 1
                 FROM msg_meta parent
@@ -342,7 +340,7 @@ async def cmd_hr(m: types.Message):
     await m.answer("📢 <b>ЗБІР</b>\n"+(" ".join(lst) if lst else "Всі в ігнорі"), parse_mode=ParseMode.HTML)
 
 @dp.message(F.text.lower().startswith('!help'))
-async def cmd_h(m: types.Message): await save_to_db(m); await m.answer("Команди: !текст, !models, !psearch, !analyze, !system, !forget, !temp, !stats, !here, !ignorehere, !roulette", parse_mode=ParseMode.HTML)
+async def cmd_h(m: types.Message): await save_to_db(m); await m.answer("Команди: !текст, !models, !analyze, !system, !forget, !temp, !stats, !here, !ignorehere, !roulette", parse_mode=ParseMode.HTML)
 
 @dp.message(F.text.startswith('!say') & (F.chat.type=='private'))
 async def cmd_say(m: types.Message): 
@@ -350,111 +348,6 @@ async def cmd_say(m: types.Message):
 
 @dp.message(F.entities & ~F.text.startswith('!'))
 async def ment_h(m: types.Message): await save_to_db(m); await check_for_sleeping_uzbeks(m)
-
-# --- 🔥 КОМАНДА !psearch (Google No-API Scraper) ---
-
-# Допоміжна функція для скрапінгу
-def google_image_search(query):
-    ua = UserAgent()
-    headers = {
-        "User-Agent": ua.random,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    }
-    
-    url = f"https://www.google.com/search?q={query}&tbm=isch&ie=UTF-8"
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        # Regex для пошуку URL картинок у JSON-блоках Google
-        # Шукає посилання, що закінчуються на типові розширення
-        pattern = r'\["(https?://[^"]+)",\d+,\d+\]'
-        matches = re.findall(pattern, response.text)
-        
-        # Фільтруємо, щоб були тільки картинки
-        valid_urls = []
-        for url in matches:
-            if url.endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                valid_urls.append(url)
-        
-        # Видаляємо дублікати, зберігаючи порядок
-        seen = set()
-        unique_urls = [x for x in valid_urls if not (x in seen or seen.add(x))]
-        
-        return unique_urls[:150] # Повертаємо максимум 150
-    
-    except Exception as e:
-        logging.error(f"Google Scraper Error: {e}")
-        return []
-
-
-def get_psearch_keyboard(search_id, current_index, total_count):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⏪", callback_data=f"ps_nav_{search_id}_0")
-    prev_idx = max(0, current_index - 1)
-    builder.button(text="⬅️", callback_data=f"ps_nav_{search_id}_{prev_idx}")
-    builder.button(text=f"{current_index + 1}/{total_count}", callback_data="noop")
-    next_idx = min(total_count - 1, current_index + 1)
-    builder.button(text="➡️", callback_data=f"ps_nav_{search_id}_{next_idx}")
-    builder.button(text="⏩", callback_data=f"ps_nav_{search_id}_{total_count - 1}")
-    builder.adjust(5)
-    return builder.as_markup()
-
-@dp.message(F.text.lower().startswith('!psearch'))
-async def cmd_psearch(message: types.Message):
-    await save_to_db(message)
-    query = message.text[8:].strip()
-    if not query:
-        await message.reply("Введи запит. Наприклад: `!psearch котик`", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    await message.bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
-
-    # Виконуємо скрапінг у потоці, щоб не блокувати бота
-    image_urls = await asyncio.to_thread(google_image_search, query)
-    
-    if not image_urls:
-        await message.reply("❌ Google заблокував запит (IP Ban) або нічого не знайшов. Спробуй пізніше.")
-        return
-
-    search_id = str(uuid.uuid4())[:8]
-    SEARCH_RESULTS[search_id] = image_urls
-    
-    first_url = image_urls[0]
-    markup = get_psearch_keyboard(search_id, 0, len(image_urls))
-    
-    try:
-        await message.reply_photo(photo=first_url, caption=f"🔎 <b>{query}</b> (Google)", reply_markup=markup, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await message.reply(f"Знайшов {len(image_urls)} фото, але Telegram не зміг завантажити перше. Спробуй гортати.")
-
-@dp.callback_query(F.data.startswith("ps_nav_"))
-async def cb_psearch_nav(callback: CallbackQuery):
-    try:
-        _, _, search_id, idx_str = callback.data.split("_")
-        index = int(idx_str)
-        images = SEARCH_RESULTS.get(search_id)
-        if not images:
-            await callback.answer("⚠️ Цей пошук застарів.", show_alert=True)
-            return
-
-        if index < 0: index = 0
-        if index >= len(images): index = len(images) - 1
-
-        img_url = images[index]
-        markup = get_psearch_keyboard(search_id, index, len(images))
-        media = InputMediaPhoto(media=img_url, caption=callback.message.caption, parse_mode=ParseMode.HTML)
-        try: await callback.message.edit_media(media=media, reply_markup=markup)
-        except Exception as e:
-            if "message is not modified" in str(e): await callback.answer()
-            else: await callback.answer("⚠️ Не вдалося завантажити.", show_alert=True)
-                
-    except Exception as e:
-        logging.error(f"Psearch nav error: {e}")
-        await callback.answer("Помилка навігації.")
-
-@dp.callback_query(F.data == "noop")
-async def cb_noop(callback: CallbackQuery): await callback.answer()
 
 # --- 🔥 УНІВЕРСАЛЬНИЙ GPT (МУЛЬТИМОДАЛЬНИЙ) ---
 @dp.message(F.text.startswith('!') | (F.caption & F.caption.startswith('!')))
@@ -466,7 +359,7 @@ async def cmd_gpt(message: types.Message):
     full_text = message.text or message.caption or ""
     command_word = full_text.split()[0].lower()
     
-    if command_word in ['!here', '!stats', '!roulette', '!system', '!clearsystem', '!temp', '!help', '!say', '!analyze', '!forget', '!models', '!model', '!ignorehere', '!psearch']:
+    if command_word in ['!here', '!stats', '!roulette', '!system', '!clearsystem', '!temp', '!help', '!say', '!analyze', '!forget', '!models', '!model', '!ignorehere']:
         return
 
     prompt = full_text[1:].strip()
