@@ -2,3 +2,4 @@ aiogram
 asyncpg
 python-dotenv
 openai 
+duckduckgo-search

@@ -3,13 +3,16 @@ import logging
 import os
 import sys
 import asyncpg
+import random
+import uuid
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import CallbackQuery
+from aiogram.types import CallbackQuery, InputMediaPhoto
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from duckduckgo_search import DDGS
 
 # --- КОНФІГУРАЦІЯ ---
 load_dotenv()
@@ -21,7 +24,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = 548789253
 TARGET_CHAT_ID = -1001981383150
 
-# Глибина контексту
 THREAD_DEPTH_LIMIT = 10 
 
 if not API_TOKEN or not NEON_URL:
@@ -36,7 +38,6 @@ db_pool = None
 
 gpt_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# Налаштування за замовчуванням
 DEFAULT_SYSTEM_PROMPT = None 
 DEFAULT_TEMPERATURE = 1.0  
 DEFAULT_MODEL = "gpt-5-mini" 
@@ -46,6 +47,9 @@ AVAILABLE_MODELS = [
     "gpt-5.2-chat-latest",
     "gpt-5-pro"
 ]
+
+# Сховище результатів пошуку
+SEARCH_RESULTS = {}
 
 # --- БАЗА ДАНИХ ---
 async def create_pool():
@@ -98,29 +102,24 @@ async def save_to_db(message: types.Message):
             """, chat.id, message.message_id, message.text)
         elif message.photo:
             photo = message.photo[-1]
-            # Зберігаємо file_id у колонку photo_url (так історично склалося у твоїй структурі)
             await con.execute("""
                 INSERT INTO photo (chat_id, msg_id, photo_url, caption)
                 VALUES ($1, $2, $3, $4)
                 ON CONFLICT (chat_id, msg_id) DO NOTHING
             """, chat.id, message.message_id, photo.file_id, message.caption)
 
-# --- 🔥 ОНОВЛЕНО: ТЕПЕР ТЯГНЕМО І ФОТО ---
+# --- ЛОГІКА ІСТОРІЇ ---
 async def get_thread_context(chat_id, start_msg_id):
     async with db_pool.acquire() as con:
         sql = """
             WITH RECURSIVE thread AS (
-                -- Поточне повідомлення
                 SELECT m.msg_id, m.reply_to, m.user_id, m.date_msg, 
                        t.msg_txt, p.photo_url as file_id, 1 as depth
                 FROM msg_meta m
                 LEFT JOIN msg_txt t ON m.chat_id = t.chat_id AND m.msg_id = t.msg_id
                 LEFT JOIN photo p ON m.chat_id = p.chat_id AND m.msg_id = p.msg_id
                 WHERE m.chat_id = $1 AND m.msg_id = $2
-
                 UNION ALL
-
-                -- Батьківські повідомлення
                 SELECT parent.msg_id, parent.reply_to, parent.user_id, parent.date_msg, 
                        pt.msg_txt, pp.photo_url as file_id, thread.depth + 1
                 FROM msg_meta parent
@@ -137,11 +136,9 @@ async def get_thread_context(chat_id, start_msg_id):
         rows = await con.fetch(sql, chat_id, start_msg_id, THREAD_DEPTH_LIMIT)
         return rows
 
-# --- 🔥 ХЕЛПЕР: ОТРИМАННЯ URL КАРТИНКИ ---
 async def get_image_url(file_id):
     try:
         file = await bot.get_file(file_id)
-        # Формуємо пряме посилання, яке зможе прочитати OpenAI
         return f"https://api.telegram.org/file/bot{API_TOKEN}/{file.file_path}"
     except Exception as e:
         logging.error(f"Error getting file url: {e}")
@@ -171,7 +168,6 @@ async def send_chunked_response(message_obj, text):
     if len(text) <= 4000: sent = await send_safe(text); 
     else:
         for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]: await send_safe(chunk)
-    # Зберігання бота ми робимо в основному хендлері, тут просто відправка
 
 def get_cutoff_date(p):
     n = datetime.utcnow()
@@ -344,7 +340,7 @@ async def cmd_hr(m: types.Message):
     await m.answer("📢 <b>ЗБІР</b>\n"+(" ".join(lst) if lst else "Всі в ігнорі"), parse_mode=ParseMode.HTML)
 
 @dp.message(F.text.lower().startswith('!help'))
-async def cmd_h(m: types.Message): await save_to_db(m); await m.answer("Команди: !текст, !models, !analyze, !system, !forget, !temp, !stats, !here, !ignorehere, !roulette", parse_mode=ParseMode.HTML)
+async def cmd_h(m: types.Message): await save_to_db(m); await m.answer("Команди: !текст, !models, !psearch, !analyze, !system, !forget, !temp, !stats, !here, !ignorehere, !roulette", parse_mode=ParseMode.HTML)
 
 @dp.message(F.text.startswith('!say') & (F.chat.type=='private'))
 async def cmd_say(m: types.Message): 
@@ -353,6 +349,85 @@ async def cmd_say(m: types.Message):
 @dp.message(F.entities & ~F.text.startswith('!'))
 async def ment_h(m: types.Message): await save_to_db(m); await check_for_sleeping_uzbeks(m)
 
+# --- 🔥 КОМАНДА !psearch (ГАЛЕРЕЯ) ---
+
+def get_psearch_keyboard(search_id, current_index, total_count):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⏪", callback_data=f"ps_nav_{search_id}_0")
+    prev_idx = max(0, current_index - 1)
+    builder.button(text="⬅️", callback_data=f"ps_nav_{search_id}_{prev_idx}")
+    builder.button(text=f"{current_index + 1}/{total_count}", callback_data="noop")
+    next_idx = min(total_count - 1, current_index + 1)
+    builder.button(text="➡️", callback_data=f"ps_nav_{search_id}_{next_idx}")
+    builder.button(text="⏩", callback_data=f"ps_nav_{search_id}_{total_count - 1}")
+    builder.adjust(5)
+    return builder.as_markup()
+
+@dp.message(F.text.lower().startswith('!psearch'))
+async def cmd_psearch(message: types.Message):
+    await save_to_db(message)
+    query = message.text[8:].strip()
+    if not query:
+        await message.reply("Введи запит. Наприклад: `!psearch котик`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
+
+    try:
+        # safesearch='off' - БЕЗПЕЧНИЙ ПОШУК ВИМКНЕНО
+        # shuffle прибрано, результати в порядку релевантності
+        with DDGS() as ddgs:
+            results = list(ddgs.images(query, max_results=150, safesearch='off'))
+        
+        if not results:
+            await message.reply("На жаль, нічого не знайдено.")
+            return
+
+        search_id = str(uuid.uuid4())[:8]
+        image_urls = [res.get('image') for res in results if res.get('image')]
+        
+        if not image_urls:
+            await message.reply("Знайшов результати, але без посилань на фото.")
+            return
+
+        SEARCH_RESULTS[search_id] = image_urls
+        first_url = image_urls[0]
+        markup = get_psearch_keyboard(search_id, 0, len(image_urls))
+        
+        await message.reply_photo(photo=first_url, caption=f"🔎 <b>{query}</b>", reply_markup=markup, parse_mode=ParseMode.HTML)
+        
+    except Exception as e:
+        logging.error(f"Psearch error: {e}")
+        await message.reply(f"Помилка пошуку: {e}")
+
+@dp.callback_query(F.data.startswith("ps_nav_"))
+async def cb_psearch_nav(callback: CallbackQuery):
+    try:
+        _, _, search_id, idx_str = callback.data.split("_")
+        index = int(idx_str)
+        images = SEARCH_RESULTS.get(search_id)
+        if not images:
+            await callback.answer("⚠️ Цей пошук застарів.", show_alert=True)
+            return
+
+        if index < 0: index = 0
+        if index >= len(images): index = len(images) - 1
+
+        img_url = images[index]
+        markup = get_psearch_keyboard(search_id, index, len(images))
+        media = InputMediaPhoto(media=img_url, caption=callback.message.caption, parse_mode=ParseMode.HTML)
+        try: await callback.message.edit_media(media=media, reply_markup=markup)
+        except Exception as e:
+            if "message is not modified" in str(e): await callback.answer()
+            else: await callback.answer("⚠️ Не вдалося завантажити.", show_alert=True)
+                
+    except Exception as e:
+        logging.error(f"Psearch nav error: {e}")
+        await callback.answer("Помилка навігації.")
+
+@dp.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery): await callback.answer()
+
 # --- 🔥 УНІВЕРСАЛЬНИЙ GPT (МУЛЬТИМОДАЛЬНИЙ) ---
 @dp.message(F.text.startswith('!') | (F.caption & F.caption.startswith('!')))
 async def cmd_gpt(message: types.Message):
@@ -360,15 +435,13 @@ async def cmd_gpt(message: types.Message):
     await check_for_sleeping_uzbeks(message)
     if not gpt_client: return
 
-    # Визначаємо текст команди (з тексту або підпису фото)
     full_text = message.text or message.caption or ""
     command_word = full_text.split()[0].lower()
     
-    if command_word in ['!here', '!stats', '!roulette', '!system', '!clearsystem', '!temp', '!help', '!say', '!analyze', '!forget', '!models', '!model', '!ignorehere']:
+    if command_word in ['!here', '!stats', '!roulette', '!system', '!clearsystem', '!temp', '!help', '!say', '!analyze', '!forget', '!models', '!model', '!ignorehere', '!psearch']:
         return
 
     prompt = full_text[1:].strip()
-    # Якщо пустий текст, але є фото - це ок (наприклад просто кинув фото з "!")
     if not prompt and not message.photo: return
 
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
@@ -391,56 +464,27 @@ async def cmd_gpt(message: types.Message):
     messages_payload = []
     if sys_prompt: messages_payload.append({"role": "system", "content": sys_prompt})
 
-    # 🔥 ФОРМУЄМО МУЛЬТИМОДАЛЬНИЙ КОНТЕКСТ
     try:
-        # Витягуємо ланцюжок (текст + file_id)
         history_rows = await get_thread_context(chat_id, message.message_id)
-        
         for row in history_rows:
-            uid = row['user_id']
-            text_content = row['msg_txt']
-            file_id = row['file_id']
-            name = row['first_name'] or "User"
-            
-            # Формуємо контент повідомлення (може бути масивом)
+            uid, text_content, file_id, name = row['user_id'], row['msg_txt'], row['file_id'], row['first_name'] or "User"
             content_block = []
-            
-            # 1. Додаємо текст (якщо є)
             if text_content:
-                # Якщо це юзер - додаємо ім'я
                 final_text = text_content if uid == bot_id else f"{name}: {text_content}"
                 content_block.append({"type": "text", "text": final_text})
-            
-            # 2. Додаємо фото (якщо є)
             if file_id:
                 img_url = await get_image_url(file_id)
-                if img_url:
-                    content_block.append({
-                        "type": "image_url",
-                        "image_url": {"url": img_url}
-                    })
-            
-            # Додаємо в історію, якщо блок не пустий
+                if img_url: content_block.append({"type": "image_url", "image_url": {"url": img_url}})
             if content_block:
-                role = "assistant" if uid == bot_id else "user"
-                messages_payload.append({"role": role, "content": content_block})
+                messages_payload.append({"role": "assistant" if uid == bot_id else "user", "content": content_block})
                 
     except Exception as e:
-        logging.error(f"Context error: {e}")
-        # Фолбек: просто текст поточного
         messages_payload.append({"role": "user", "content": prompt})
 
     try:
-        response = await gpt_client.chat.completions.create(
-            model=model_to_use, 
-            messages=messages_payload,
-            temperature=temperature
-        )
-        reply_text = response.choices[0].message.content
-        await send_chunked_response(message, reply_text)
-
+        response = await gpt_client.chat.completions.create(model=model_to_use, messages=messages_payload, temperature=temperature)
+        await send_chunked_response(message, response.choices[0].message.content)
     except Exception as e:
-        logging.error(f"OpenAI Error: {e}")
         await message.reply(f"Помилка AI: {e}")
 
 # --- ЛОГЕР ---
