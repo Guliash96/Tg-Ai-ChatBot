@@ -22,8 +22,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = 548789253
 TARGET_CHAT_ID = -1001981383150
 
-# Глибина рекурсії (скільки реплаїв назад пам'ятати)
-THREAD_DEPTH_LIMIT = 10 
+# Глибина контексту (скільки реплаїв назад читати)
+THREAD_DEPTH_LIMIT = 15 
 
 if not API_TOKEN or not NEON_URL:
     print("❌ ПОМИЛКА: Перевір .env файл")
@@ -104,12 +104,13 @@ async def save_to_db(message: types.Message):
                 ON CONFLICT (chat_id, msg_id) DO NOTHING
             """, chat.id, message.message_id, photo.file_id, message.caption)
 
-# --- 🔥 ЛОГІКА ІСТОРІЇ (РЕПЛАЙ-ЛАНЦЮЖКИ) ---
+# --- 🔥 ЛОГІКА ІСТОРІЇ (РЕКУРСИВНІ РЕПЛАЇ) ---
 async def get_thread_context(chat_id, start_msg_id):
     async with db_pool.acquire() as con:
+        # Цей SQL "повзе" вгору по зв'язках reply_to
         sql = """
             WITH RECURSIVE thread AS (
-                -- 1. Стартове повідомлення
+                -- 1. Поточне повідомлення (з якого почали)
                 SELECT m.msg_id, m.reply_to, m.user_id, m.date_msg, 
                        t.msg_txt, p.photo_url as file_id, 1 as depth
                 FROM msg_meta m
@@ -119,7 +120,7 @@ async def get_thread_context(chat_id, start_msg_id):
 
                 UNION ALL
 
-                -- 2. Рекурсивний пошук "батьків"
+                -- 2. Знаходимо "батька" (повідомлення, на яке відповіли)
                 SELECT parent.msg_id, parent.reply_to, parent.user_id, parent.date_msg, 
                        pt.msg_txt, pp.photo_url as file_id, thread.depth + 1
                 FROM msg_meta parent
@@ -128,6 +129,7 @@ async def get_thread_context(chat_id, start_msg_id):
                 JOIN thread ON thread.reply_to = parent.msg_id
                 WHERE parent.chat_id = $1 AND thread.depth < $3
             )
+            -- 3. Виводимо весь ланцюжок у хронологічному порядку
             SELECT thread.*, u.first_name 
             FROM thread
             LEFT JOIN users u ON thread.user_id = u.user_id
@@ -136,6 +138,7 @@ async def get_thread_context(chat_id, start_msg_id):
         rows = await con.fetch(sql, chat_id, start_msg_id, THREAD_DEPTH_LIMIT)
         return rows
 
+# --- ХЕЛПЕРИ ---
 async def get_image_url(file_id):
     try:
         file = await bot.get_file(file_id)
@@ -168,6 +171,8 @@ async def send_chunked_response(message_obj, text):
     if len(text) <= 4000: sent = await send_safe(text); 
     else:
         for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]: await send_safe(chunk)
+    # Зберігаємо відповідь бота в базу, щоб на неї можна було робити REPLAY
+    if sent: await save_to_db(sent)
 
 def get_cutoff_date(p):
     n = datetime.utcnow()
