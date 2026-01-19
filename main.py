@@ -22,7 +22,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = 548789253
 TARGET_CHAT_ID = -1001981383150
 
-# Глибина контексту (скільки реплаїв назад читати)
+# Глибина контексту (скільки останніх повідомлень пам'ятати)
 THREAD_DEPTH_LIMIT = 15 
 
 if not API_TOKEN or not NEON_URL:
@@ -63,54 +63,56 @@ async def save_to_db(message: types.Message):
     chat = message.chat
     if not user: return
 
-    async with db_pool.acquire() as con:
-        await con.execute("""
-            INSERT INTO users (user_id, username, first_name, last_name)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (user_id) DO UPDATE 
-            SET username = EXCLUDED.username, first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name
-        """, user.id, user.username, user.first_name, user.last_name)
-
-        await con.execute("""
-            INSERT INTO chats (chat_id, type, title)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (chat_id) DO UPDATE SET type = EXCLUDED.type, title = EXCLUDED.title
-        """, chat.id, chat.type, chat.title)
-
-        msg_date = message.date.replace(tzinfo=None)
-        reply_to = message.reply_to_message.message_id if message.reply_to_message else None
-        
-        msg_type = 'text'
-        if message.photo: msg_type = 'photo'
-        elif message.sticker: msg_type = 'sticker'
-
-        await con.execute("""
-            INSERT INTO msg_meta (chat_id, msg_id, user_id, date_msg, msg_type, reply_to)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (chat_id, msg_id) DO NOTHING
-        """, chat.id, message.message_id, user.id, msg_date, msg_type, reply_to)
-
-        if message.text:
+    try:
+        async with db_pool.acquire() as con:
             await con.execute("""
-                INSERT INTO msg_txt (chat_id, msg_id, msg_txt)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (chat_id, msg_id) DO NOTHING
-            """, chat.id, message.message_id, message.text)
-        elif message.photo:
-            photo = message.photo[-1]
-            await con.execute("""
-                INSERT INTO photo (chat_id, msg_id, photo_url, caption)
+                INSERT INTO users (user_id, username, first_name, last_name)
                 VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id) DO UPDATE 
+                SET username = EXCLUDED.username, first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name
+            """, user.id, user.username, user.first_name, user.last_name)
+
+            await con.execute("""
+                INSERT INTO chats (chat_id, type, title)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (chat_id) DO UPDATE SET type = EXCLUDED.type, title = EXCLUDED.title
+            """, chat.id, chat.type, chat.title)
+
+            msg_date = message.date.replace(tzinfo=None)
+            reply_to = message.reply_to_message.message_id if message.reply_to_message else None
+            
+            msg_type = 'text'
+            if message.photo: msg_type = 'photo'
+            elif message.sticker: msg_type = 'sticker'
+
+            await con.execute("""
+                INSERT INTO msg_meta (chat_id, msg_id, user_id, date_msg, msg_type, reply_to)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 ON CONFLICT (chat_id, msg_id) DO NOTHING
-            """, chat.id, message.message_id, photo.file_id, message.caption)
+            """, chat.id, message.message_id, user.id, msg_date, msg_type, reply_to)
+
+            if message.text:
+                await con.execute("""
+                    INSERT INTO msg_txt (chat_id, msg_id, msg_txt)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (chat_id, msg_id) DO NOTHING
+                """, chat.id, message.message_id, message.text)
+            elif message.photo:
+                photo = message.photo[-1]
+                await con.execute("""
+                    INSERT INTO photo (chat_id, msg_id, photo_url, caption)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (chat_id, msg_id) DO NOTHING
+                """, chat.id, message.message_id, photo.file_id, message.caption)
+
+    except Exception as e:
+        logging.error(f"Save DB Error: {e}")
 
 # --- 🔥 ЛОГІКА ІСТОРІЇ (РЕКУРСИВНІ РЕПЛАЇ) ---
 async def get_thread_context(chat_id, start_msg_id):
     async with db_pool.acquire() as con:
-        # Цей SQL "повзе" вгору по зв'язках reply_to
         sql = """
             WITH RECURSIVE thread AS (
-                -- 1. Поточне повідомлення (з якого почали)
                 SELECT m.msg_id, m.reply_to, m.user_id, m.date_msg, 
                        t.msg_txt, p.photo_url as file_id, 1 as depth
                 FROM msg_meta m
@@ -120,7 +122,6 @@ async def get_thread_context(chat_id, start_msg_id):
 
                 UNION ALL
 
-                -- 2. Знаходимо "батька" (повідомлення, на яке відповіли)
                 SELECT parent.msg_id, parent.reply_to, parent.user_id, parent.date_msg, 
                        pt.msg_txt, pp.photo_url as file_id, thread.depth + 1
                 FROM msg_meta parent
@@ -129,7 +130,6 @@ async def get_thread_context(chat_id, start_msg_id):
                 JOIN thread ON thread.reply_to = parent.msg_id
                 WHERE parent.chat_id = $1 AND thread.depth < $3
             )
-            -- 3. Виводимо весь ланцюжок у хронологічному порядку
             SELECT thread.*, u.first_name 
             FROM thread
             LEFT JOIN users u ON thread.user_id = u.user_id
@@ -164,15 +164,22 @@ async def check_for_sleeping_uzbeks(message: types.Message):
 
 async def send_chunked_response(message_obj, text):
     async def send_safe(chunk):
-        try: return await message_obj.answer(chunk, parse_mode=ParseMode.MARKDOWN)
+        try: 
+            sent_msg = await message_obj.answer(chunk, parse_mode=ParseMode.MARKDOWN)
+            await save_to_db(sent_msg) 
+            return sent_msg
         except: 
-            try: return await message_obj.answer(chunk, parse_mode=None)
+            try: 
+                sent_msg = await message_obj.answer(chunk, parse_mode=None)
+                await save_to_db(sent_msg)
+                return sent_msg
             except: return None
-    if len(text) <= 4000: sent = await send_safe(text); 
+
+    if len(text) <= 4000: 
+        await send_safe(text)
     else:
-        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]: await send_safe(chunk)
-    # Зберігаємо відповідь бота в базу, щоб на неї можна було робити REPLAY
-    if sent: await save_to_db(sent)
+        for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]: 
+            await send_safe(chunk)
 
 def get_cutoff_date(p):
     n = datetime.utcnow()
@@ -394,6 +401,11 @@ async def cmd_gpt(message: types.Message):
         history_rows = await get_thread_context(chat_id, message.message_id)
         for row in history_rows:
             uid, text_content, file_id, name = row['user_id'], row['msg_txt'], row['file_id'], row['first_name'] or "User"
+            
+            # 🔥 ОЧИЩАЄМО ТЕКСТ ВІД '!' ЩОБ БОТ НЕ БАЧИВ ЦЬОГО
+            if text_content and text_content.startswith('!'):
+                text_content = text_content[1:].strip()
+
             content_block = []
             if text_content:
                 final_text = text_content if uid == bot_id else f"{name}: {text_content}"
