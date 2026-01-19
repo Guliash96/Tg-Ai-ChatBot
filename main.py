@@ -374,9 +374,10 @@ async def cmd_psearch(message: types.Message):
     await message.bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
 
     try:
-        # 🔥 ЛІМІТ 20 КАРТИНОК, ЩОБ НЕ ОТРИМАТИ БАН (403)
+        # 🔥 ЛІМІТ 25 - ЦЕ МАКСИМУМ ДЛЯ БЕЗКОШТОВНОГО API
+        # safesearch='off' (без цензури)
         with DDGS() as ddgs:
-            results = list(ddgs.images(query, max_results=20, safesearch='off'))
+            results = list(ddgs.images(query, max_results=25, safesearch='off'))
         
         if not results:
             await message.reply("На жаль, нічого не знайдено.")
@@ -397,7 +398,7 @@ async def cmd_psearch(message: types.Message):
         
     except Exception as e:
         logging.error(f"Psearch error: {e}")
-        await message.reply(f"Помилка пошуку: {e}")
+        await message.reply(f"Помилка пошуку (Rate Limit або IP блок): {e}")
 
 @dp.callback_query(F.data.startswith("ps_nav_"))
 async def cb_psearch_nav(callback: CallbackQuery):
