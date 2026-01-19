@@ -5,6 +5,9 @@ import sys
 import asyncpg
 import random
 import uuid
+import re # <--- Для пошуку посилань у коді Google
+import requests # <--- Для запитів
+from fake_useragent import UserAgent # <--- Щоб дурити Google
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
@@ -12,7 +15,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import CallbackQuery, InputMediaPhoto
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from duckduckgo_search import DDGS
 
 # --- КОНФІГУРАЦІЯ ---
 load_dotenv()
@@ -349,7 +351,42 @@ async def cmd_say(m: types.Message):
 @dp.message(F.entities & ~F.text.startswith('!'))
 async def ment_h(m: types.Message): await save_to_db(m); await check_for_sleeping_uzbeks(m)
 
-# --- 🔥 КОМАНДА !psearch (ГАЛЕРЕЯ) ---
+# --- 🔥 КОМАНДА !psearch (Google No-API Scraper) ---
+
+# Допоміжна функція для скрапінгу
+def google_image_search(query):
+    ua = UserAgent()
+    headers = {
+        "User-Agent": ua.random,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    }
+    
+    url = f"https://www.google.com/search?q={query}&tbm=isch&ie=UTF-8"
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        # Regex для пошуку URL картинок у JSON-блоках Google
+        # Шукає посилання, що закінчуються на типові розширення
+        pattern = r'\["(https?://[^"]+)",\d+,\d+\]'
+        matches = re.findall(pattern, response.text)
+        
+        # Фільтруємо, щоб були тільки картинки
+        valid_urls = []
+        for url in matches:
+            if url.endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                valid_urls.append(url)
+        
+        # Видаляємо дублікати, зберігаючи порядок
+        seen = set()
+        unique_urls = [x for x in valid_urls if not (x in seen or seen.add(x))]
+        
+        return unique_urls[:150] # Повертаємо максимум 150
+    
+    except Exception as e:
+        logging.error(f"Google Scraper Error: {e}")
+        return []
+
 
 def get_psearch_keyboard(search_id, current_index, total_count):
     builder = InlineKeyboardBuilder()
@@ -373,32 +410,23 @@ async def cmd_psearch(message: types.Message):
 
     await message.bot.send_chat_action(chat_id=message.chat.id, action="upload_photo")
 
+    # Виконуємо скрапінг у потоці, щоб не блокувати бота
+    image_urls = await asyncio.to_thread(google_image_search, query)
+    
+    if not image_urls:
+        await message.reply("❌ Google заблокував запит (IP Ban) або нічого не знайшов. Спробуй пізніше.")
+        return
+
+    search_id = str(uuid.uuid4())[:8]
+    SEARCH_RESULTS[search_id] = image_urls
+    
+    first_url = image_urls[0]
+    markup = get_psearch_keyboard(search_id, 0, len(image_urls))
+    
     try:
-        # 🔥 ЛІМІТ 25 - ЦЕ МАКСИМУМ ДЛЯ БЕЗКОШТОВНОГО API
-        # safesearch='off' (без цензури)
-        with DDGS() as ddgs:
-            results = list(ddgs.images(query, max_results=25, safesearch='off'))
-        
-        if not results:
-            await message.reply("На жаль, нічого не знайдено.")
-            return
-
-        search_id = str(uuid.uuid4())[:8]
-        image_urls = [res.get('image') for res in results if res.get('image')]
-        
-        if not image_urls:
-            await message.reply("Знайшов результати, але без посилань на фото.")
-            return
-
-        SEARCH_RESULTS[search_id] = image_urls
-        first_url = image_urls[0]
-        markup = get_psearch_keyboard(search_id, 0, len(image_urls))
-        
-        await message.reply_photo(photo=first_url, caption=f"🔎 <b>{query}</b>", reply_markup=markup, parse_mode=ParseMode.HTML)
-        
+        await message.reply_photo(photo=first_url, caption=f"🔎 <b>{query}</b> (Google)", reply_markup=markup, parse_mode=ParseMode.HTML)
     except Exception as e:
-        logging.error(f"Psearch error: {e}")
-        await message.reply(f"Помилка пошуку (Rate Limit або IP блок): {e}")
+        await message.reply(f"Знайшов {len(image_urls)} фото, але Telegram не зміг завантажити перше. Спробуй гортати.")
 
 @dp.callback_query(F.data.startswith("ps_nav_"))
 async def cb_psearch_nav(callback: CallbackQuery):
