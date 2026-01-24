@@ -22,7 +22,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = 548789253
 TARGET_CHAT_ID = -1001981383150
 
-# Глибина контексту (скільки останніх повідомлень пам'ятати)
+# 🔥 ID КОРИСТУВАЧА, ЯКОГО БЛОКУЄМО
+SHIZOID_ID = 416902251 
+
+# Глибина контексту
 THREAD_DEPTH_LIMIT = 15 
 
 if not API_TOKEN or not NEON_URL:
@@ -323,7 +326,7 @@ async def cb_u_det(c: CallbackQuery):
         tot = await con.fetchval("SELECT COUNT(*) FROM msg_meta WHERE chat_id=$1 AND user_id=$2" + (" AND date_msg>=$3" if cut else ""), c.message.chat.id, uid, *([cut] if cut else []))
         sts = await con.fetch("SELECT msg_type, COUNT(*) as cnt FROM msg_meta WHERE chat_id=$1 AND user_id=$2" + (" AND date_msg>=$3" if cut else "") + " GROUP BY msg_type ORDER BY cnt DESC", c.message.chat.id, uid, *([cut] if cut else []))
     txt = f"👤 <b>{n}</b> ({get_period_name(per)})\n📨 {tot}\n" + "\n".join([f"🔹 {r['msg_type']}: {r['cnt']}" for r in sts])
-    b=InlineKeyboardBuilder(); b.button(text="🔙",callback_data=f"list_usr_{per}"); await c.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=b.as_markup())
+    b=InlineKeyboardBuilder(); b.button(text="🔙",callback_data="ask_period_user"); await c.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=b.as_markup())
 
 @dp.message(F.text.lower().startswith('!ignorehere'))
 async def cmd_ign(m: types.Message):
@@ -364,8 +367,17 @@ async def ment_h(m: types.Message): await save_to_db(m); await check_for_sleepin
 # --- 🔥 УНІВЕРСАЛЬНИЙ GPT (МУЛЬТИМОДАЛЬНИЙ) ---
 @dp.message(F.text.startswith('!') | (F.caption & F.caption.startswith('!')))
 async def cmd_gpt(message: types.Message):
+    # 1. Запис у базу
     await save_to_db(message)
+    
+    # 2. Перевірка на "сплячих узбеків"
     await check_for_sleeping_uzbeks(message)
+
+    # 🔥 3. ПЕРЕВІРКА НА ШИЗОЇДА (З КЛОУНОМ)
+    if message.from_user.id == SHIZOID_ID or message.chat.id == SHIZOID_ID:
+        await message.reply("Іди лікуйся шизоїд йобаний 🤡")
+        return # Стоп-кран
+
     if not gpt_client: return
 
     full_text = message.text or message.caption or ""
@@ -374,7 +386,8 @@ async def cmd_gpt(message: types.Message):
     if command_word in ['!here', '!stats', '!roulette', '!system', '!clearsystem', '!temp', '!help', '!say', '!analyze', '!forget', '!models', '!model', '!ignorehere']:
         return
 
-    prompt = full_text[1:].strip()
+    # 🔥 ЧИСТИЙ ТЕКСТ ЗАПИТУ
+    prompt = full_text[1:].strip() 
     if not prompt and not message.photo: return
 
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
@@ -402,17 +415,20 @@ async def cmd_gpt(message: types.Message):
         for row in history_rows:
             uid, text_content, file_id, name = row['user_id'], row['msg_txt'], row['file_id'], row['first_name'] or "User"
             
-            # 🔥 ОЧИЩАЄМО ТЕКСТ ВІД '!' ЩОБ БОТ НЕ БАЧИВ ЦЬОГО
+            # 🔥 ОЧИЩАЄМО ТЕКСТ ДЛЯ AI (БЕЗ '!' і БЕЗ ІМЕНІ)
             if text_content and text_content.startswith('!'):
                 text_content = text_content[1:].strip()
 
             content_block = []
             if text_content:
-                final_text = text_content if uid == bot_id else f"{name}: {text_content}"
+                # ВІДПРАВЛЯЄМО ТІЛЬКИ ЧИСТИЙ ТЕКСТ (без Name: )
+                final_text = text_content 
                 content_block.append({"type": "text", "text": final_text})
+            
             if file_id:
                 img_url = await get_image_url(file_id)
                 if img_url: content_block.append({"type": "image_url", "image_url": {"url": img_url}})
+            
             if content_block:
                 messages_payload.append({"role": "assistant" if uid == bot_id else "user", "content": content_block})
                 
