@@ -22,8 +22,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_ID = 548789253
 TARGET_CHAT_ID = -1001981383150
 
-# 🔥 ID КОРИСТУВАЧА, ЯКОГО БЛОКУЄМО
-SHIZOID_ID = 548789253 
+# 🔥 ID ЗАБАНЕНОГО КОРИСТУВАЧА
+SHIZOID_ID = 416902251 
 
 # Глибина контексту
 THREAD_DEPTH_LIMIT = 15 
@@ -111,7 +111,7 @@ async def save_to_db(message: types.Message):
     except Exception as e:
         logging.error(f"Save DB Error: {e}")
 
-# --- 🔥 ЛОГІКА ІСТОРІЇ (РЕКУРСИВНІ РЕПЛАЇ) ---
+# --- ЛОГІКА ІСТОРІЇ (РЕКУРСИВНІ РЕПЛАЇ) ---
 async def get_thread_context(chat_id, start_msg_id):
     async with db_pool.acquire() as con:
         sql = """
@@ -189,6 +189,15 @@ def get_cutoff_date(p):
     return n-timedelta(days=1) if p=='1d' else n-timedelta(days=7) if p=='7d' else n-timedelta(days=30) if p=='30d' else None
 
 def get_period_name(p): return "24 години" if p=='1d' else "7 днів" if p=='7d' else "30 днів" if p=='30d' else "Весь час"
+
+# --- 🔥 ГЛОБАЛЬНЕ БЛОКУВАННЯ ШИЗОЇДА ---
+@dp.message(F.from_user.id == SHIZOID_ID)
+async def global_shizoid_block(message: types.Message):
+    # Відповідаємо тільки якщо це спроба викликати бота
+    full_text = message.text or message.caption or ""
+    if full_text.startswith('!'):
+        await message.reply("Іди лікуйся шизоїд йобаний 🤡")
+    return # Далі обробка повідомлення не йде
 
 # --- НАЛАШТУВАННЯ ---
 @dp.message(F.text.startswith('!system'))
@@ -326,7 +335,7 @@ async def cb_u_det(c: CallbackQuery):
         tot = await con.fetchval("SELECT COUNT(*) FROM msg_meta WHERE chat_id=$1 AND user_id=$2" + (" AND date_msg>=$3" if cut else ""), c.message.chat.id, uid, *([cut] if cut else []))
         sts = await con.fetch("SELECT msg_type, COUNT(*) as cnt FROM msg_meta WHERE chat_id=$1 AND user_id=$2" + (" AND date_msg>=$3" if cut else "") + " GROUP BY msg_type ORDER BY cnt DESC", c.message.chat.id, uid, *([cut] if cut else []))
     txt = f"👤 <b>{n}</b> ({get_period_name(per)})\n📨 {tot}\n" + "\n".join([f"🔹 {r['msg_type']}: {r['cnt']}" for r in sts])
-    b=InlineKeyboardBuilder(); b.button(text="🔙",callback_data="ask_period_user"); await c.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=b.as_markup())
+    b=InlineKeyboardBuilder(); b.button(text="🔙",callback_data=f"list_usr_{per}"); await c.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=b.as_markup())
 
 @dp.message(F.text.lower().startswith('!ignorehere'))
 async def cmd_ign(m: types.Message):
@@ -367,26 +376,19 @@ async def ment_h(m: types.Message): await save_to_db(m); await check_for_sleepin
 # --- 🔥 УНІВЕРСАЛЬНИЙ GPT (МУЛЬТИМОДАЛЬНИЙ) ---
 @dp.message(F.text.startswith('!') | (F.caption & F.caption.startswith('!')))
 async def cmd_gpt(message: types.Message):
-    # 1. Запис у базу
     await save_to_db(message)
-    
-    # 2. Перевірка на "сплячих узбеків"
     await check_for_sleeping_uzbeks(message)
-
-    # 🔥 3. ПЕРЕВІРКА НА ШИЗОЇДА (З КЛОУНОМ)
-    if message.from_user.id == SHIZOID_ID or message.chat.id == SHIZOID_ID:
-        await message.reply("Іди лікуйся шизоїд йобаний 🤡")
-        return # Стоп-кран
 
     if not gpt_client: return
 
     full_text = message.text or message.caption or ""
     command_word = full_text.split()[0].lower()
     
+    # Список команд, які не повинні йти в GPT
     if command_word in ['!here', '!stats', '!roulette', '!system', '!clearsystem', '!temp', '!help', '!say', '!analyze', '!forget', '!models', '!model', '!ignorehere']:
         return
 
-    # 🔥 ЧИСТИЙ ТЕКСТ ЗАПИТУ
+    # 🔥 ЧИСТИЙ ТЕКСТ ЗАПИТУ (тільки після '!')
     prompt = full_text[1:].strip() 
     if not prompt and not message.photo: return
 
@@ -415,13 +417,13 @@ async def cmd_gpt(message: types.Message):
         for row in history_rows:
             uid, text_content, file_id, name = row['user_id'], row['msg_txt'], row['file_id'], row['first_name'] or "User"
             
-            # 🔥 ОЧИЩАЄМО ТЕКСТ ДЛЯ AI (БЕЗ '!' і БЕЗ ІМЕНІ)
+            # 🔥 ОЧИЩАЄМО ТЕКСТ ДЛЯ AI (БЕЗ '!' і БЕЗ ПРИСТАВКИ ІМЕНІ)
             if text_content and text_content.startswith('!'):
                 text_content = text_content[1:].strip()
 
             content_block = []
             if text_content:
-                # ВІДПРАВЛЯЄМО ТІЛЬКИ ЧИСТИЙ ТЕКСТ (без Name: )
+                # Передаємо тільки текст, бо роль (user/assistant) вже вказана в ролі об'єкта
                 final_text = text_content 
                 content_block.append({"type": "text", "text": final_text})
             
